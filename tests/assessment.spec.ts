@@ -1,24 +1,29 @@
 /** Main-session assessor per-eval state and context loading. */
-import { expect, it, vi } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AssessmentSchema, EvalReadSchema, MasterAssessor, type AssessorHost } from '../src/app/assessment.ts'
 import { mainAdmissionPolicy } from '../src/app/context.ts'
 import { Engine, MemoryRepositories, type Executor, type Policy, type Trigger } from '../src/core/index.ts'
-import type { Commands } from '../src/infra/commands.ts'
+import { Commands } from '../src/infra/commands.ts'
+import type { Deployment } from '../src/deployment.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { testDeployment } from './fixtures/deployment.ts'
+import { gitlabAccount } from './fixtures/gitlab.ts'
 import { deferred } from './fixtures/async.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 
+/** The VCS a fixture deployment works through: a GitLab one reads its repository through glab instead of gh. */
+interface SetupOptions { deployment?: Deployment; commands?: Commands }
 /** Assessor fixture backed by in-memory repositories and fake GitHub Issue and file reads. */
 function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.from({ length: 5 }, (_, i) => `comment ${i}`),
-  threadContext?: AssessorHost['threadContext']) {
+  threadContext?: AssessorHost['threadContext'], options: SetupOptions = {}) {
   const comments = bodies.map((body, i) => ({ id: i, html_url: `https://github.com/acme/widgets/issues/1#c${i}`,
     user: { login: 'bob' }, created_at: '2026-09-09T00:00:00Z', body }))
   const gate = { issue: undefined as Promise<void> | undefined }
-  const commands = {
-    repository: 'acme/widgets', deployment: testDeployment(),
+  const deployment = options.deployment ?? testDeployment()
+  const commands = options.commands ?? {
+    repository: deployment.repository, deployment,
     withSignal() { return commands },
     gh: vi.fn(async (args: string[]) => {
       await gate.issue
@@ -37,7 +42,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
   sources.register(githubKind)
   let engine!: Engine
   const host: AssessorHost = {
-    get engine() { return engine }, commands, deployment: testDeployment(), settings: () => SettingsSchema.parse({}),
+    get engine() { return engine }, commands, deployment, settings: () => SettingsSchema.parse({}),
     threadContext: threadContext ?? (trigger => sources.threadContext(trigger)),
     effects: { enqueue: () => {}, handle: () => {} }, paused: () => false, deliver: async () => {}, candidateCard: async candidate => ({ eval_id: candidate.evalId }),
   }
@@ -62,6 +67,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
 const issue = (n: number): Trigger => ({ id: `issue-${n}`, source: 'github', threads: [{ source: 'github', id: String(n) }], actor: { source: 'github', id: 'bob' }, human: true,
   at: new Date(Date.UTC(2026, 8, 9, 0, 0, n)).toISOString(), text: `issue ${n}`, url: `https://github.com/acme/widgets/issues/${n}`, meta: { number: n } })
 const signal = new AbortController().signal
+afterEach(() => vi.restoreAllMocks())
 
 it('keeps nothing for an Eval once it is decided, as for one that timed out', async () => {
   const s = setup()
@@ -79,6 +85,22 @@ it('keeps nothing for an Eval once it is decided, as for one that timed out', as
   s.repo.threads.save({ ...thread, expired: 2, evaluating: { ...thread.evaluating!, delivered: '2000-01-01T00:00:00.000Z', deadline: '2000-01-01T00:00:00.000Z' } })
   s.engine.evaluateDue()
   expect(s.size()).toBe(0)
+})
+
+it('reads repository files and directories of a GitLab deployment through GitLab, not GitHub', async () => {
+  const deployment: Deployment = { ...testDeployment(), vcs: 'gitlab', repository: 'acme/widgets', gitlab: gitlabAccount(), github: undefined }
+  const commands = new Commands(() => deployment, {}, new AbortController().signal)
+  const run = vi.spyOn(Commands.prototype, 'run').mockImplementation(async (_program: string, args: string[]) =>
+    args[1]!.includes('/raw?ref=main') ? 'export const value = 1\n' : JSON.stringify([{ name: 'value.ts', type: 'blob' }]))
+  const s = setup('inferred', ['one'], undefined, { deployment, commands })
+  s.engine.receive(issue(1)); s.engine.evaluateDue()
+  await s.assessor.context('issue-1', signal)
+  expect(await s.tools.orchestrator_eval_read!({ trigger_id: 'issue-1', resource: 'file', path: 'src/value.ts', offset: 0 }, signal))
+    .toMatchObject({ text: 'export const value = 1\n' })
+  expect(await s.tools.orchestrator_eval_read!({ trigger_id: 'issue-1', resource: 'directory', path: 'src', offset: 0 }, signal))
+    .toMatchObject({ text: 'value.ts' })
+  expect(run.mock.calls.map(([, args]) => args[1]!)).toEqual(['projects/acme%2Fwidgets/repository/files/src%2Fvalue.ts/raw?ref=main',
+    'projects/acme%2Fwidgets/repository/tree?path=src&ref=main&per_page=100'])
 })
 
 it('keeps nothing from a context read that finishes after its Eval was decided', async () => {

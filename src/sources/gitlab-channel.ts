@@ -1,11 +1,11 @@
-/** GitLab outbound channel: posts notes on an Issue or merge request, or into one of its discussions, under the agent account. */
+/** GitLab outbound channel: posts notes on an Issue or merge request, into one of its discussions, or inline at a diff note's place. */
 import { z } from 'zod'
 import type { OutboundMessage } from '../core/index.ts'
-import { CliError } from '../infra/commands.ts'
+import { CliError, type Commands } from '../infra/commands.ts'
 import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks } from './kind.ts'
-import { DiscussionSchema, marker, NoteSchema, type GitlabKind, type GitlabNote } from './gitlab-trigger.ts'
+import { DiscussionSchema, marker, MergeRequestSchema, NoteSchema, type GitlabKind, type GitlabNote } from './gitlab-trigger.ts'
 
 /** The Issue or merge request a Channel address names. */
 function target(address: Record<string, string>): { kind: GitlabKind; iid: number } | undefined {
@@ -13,13 +13,39 @@ function target(address: Record<string, string>): { kind: GitlabKind; iid: numbe
   const iid = Number(address.iid)
   return kind && Number.isInteger(iid) && iid > 0 ? { kind, iid } : undefined
 }
+/** The file and line a diff note Trigger kept on its address, which an inline reply lands on. */
+function place(address: Record<string, string>): { path: string; line: number; side?: 'old' } | undefined {
+  const line = Number(address.line)
+  if (!address.path || !Number.isInteger(line) || line <= 0) return undefined
+  return { path: address.path, line, ...(address.side === 'old' ? { side: 'old' as const } : {}) }
+}
 /** True when the Issue or merge request is locked against new notes, which no retry can change. */
 const locked = (error: unknown): boolean => error instanceof CliError && error.code === 403 && /lock/i.test(error.message)
 /** True when GitLab answers that the discussion or conversation does not exist (a deleted issue or merge request, or lost access). */
 const missing = (error: unknown): boolean => error instanceof CliError && error.code === 404
+const objectPath = (kind: GitlabKind, iid: number): string => kind === 'issue' ? `issues/${iid}` : `merge_requests/${iid}`
 /**
- * Posts a note on an Issue or merge request, or a reply in one of its discussions, with an embedded HTML marker so a retried
- * send finds the note instead of posting it twice. A 404 is told apart from a lost project by reading the project once.
+ * The `position` a new inline diff note needs, built from the merge request's `diff_refs`, or undefined while GitLab still
+ * prepares the merge request and reports none.
+ */
+export async function diffPosition(commands: Commands, iid: number, at: { path: string; line: number; side?: 'old' }):
+  Promise<Record<string, string | number> | undefined> {
+  const refs = (await commands.gitlabApi(MergeRequestSchema, `merge_requests/${iid}`)).diff_refs
+  if (!refs) return undefined
+  return { position_type: 'text', base_sha: refs.base_sha, start_sha: refs.start_sha, head_sha: refs.head_sha,
+    old_path: at.path, new_path: at.path, ...at.side === 'old' ? { old_line: at.line } : { new_line: at.line } }
+}
+/** Posts a new inline diff note on the merge request at `at`; false when GitLab has not prepared the merge request's diff refs yet. */
+async function replyInline(commands: Commands, iid: number, text: string, at: { path: string; line: number; side?: 'old' }): Promise<boolean> {
+  const position = await diffPosition(commands, iid, at)
+  if (!position) return false
+  await commands.gitlabPost(z.unknown(), `merge_requests/${iid}/discussions`, { body: text, position })
+  return true
+}
+/**
+ * Posts a note on an Issue or merge request, a reply in one of its discussions, or a new inline diff note where the reply's
+ * address kept a diff note's file and line, with an embedded HTML marker so a retried send finds the note instead of posting it
+ * twice. A 404 is told apart from a lost project by reading the project once.
  */
 export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const { commands } = host
@@ -27,11 +53,13 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
   if (!gitlab) throw new Error('The GitLab Source has no working CLI')
   const reply = target(message.channel.address)
   if (!reply) throw new Error('Missing GitLab reply target')
-  const base = reply.kind === 'issue' ? `issues/${reply.iid}` : `merge_requests/${reply.iid}`
+  const base = objectPath(reply.kind, reply.iid)
   const token = marker(message.id)
   const mine = (note: GitlabNote): boolean => sameName(note.author?.username ?? '', gitlab.login) && (note.body ?? '').includes(token)
   const conversation = `${base}/notes`
   const discussionId = message.channel.address.discussionId
+  const at = place(message.channel.address)
+  const posted = (): Promise<GitlabNote[]> => commands.gitlabApi(z.array(NoteSchema), `${conversation}?per_page=100&sort=desc&activity_filter=all`)
   try {
     // Retained Channel addresses name their discussion; one GitLab no longer finds falls back to the conversation.
     const retained = discussionId
@@ -39,13 +67,14 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
         .catch((error: unknown) => { if (missing(error)) return undefined; throw error })
       : undefined
     if (retained?.notes.some(mine)) return 'sent'
-    if (!discussionId || retained) {
-      if (!discussionId && (await commands.gitlabApi(z.array(NoteSchema), `${conversation}?per_page=100&sort=desc&activity_filter=all`)).some(mine)) return 'sent'
-      const path = retained ? `${base}/discussions/${encodeURIComponent(discussionId!)}/notes` : conversation
-      await commands.gitlabApi(z.unknown(), path, '--method', 'POST', '-f', `body=${message.text}\n\n${token}`)
+    if (retained) {
+      await commands.gitlabApi(z.unknown(), `${base}/discussions/${encodeURIComponent(discussionId!)}/notes`, '--method', 'POST',
+        '-f', `body=${message.text}\n\n${token}`)
       return 'sent'
     }
-    if ((await commands.gitlabApi(z.array(NoteSchema), `${conversation}?per_page=100&sort=desc&activity_filter=all`)).some(mine)) return 'sent'
+    if ((await posted()).some(mine)) return 'sent'
+    // A diff note's reply keeps its line: a new inline discussion, and only a merge request GitLab still prepares falls back.
+    if (at && reply.kind === 'merge_request' && await replyInline(commands, reply.iid, `${message.text}\n\n${token}`, at)) return 'sent'
     await commands.gitlabApi(z.unknown(), conversation, '--method', 'POST', '-f', `body=${message.text}\n\n${token}`)
     return 'sent'
   } catch (error) {
@@ -57,6 +86,16 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
     }
     throw error
   }
+}
+/**
+ * Resolves or reopens one discussion of an Issue or merge request with `PUT …/discussions/:id?resolved=true`, which GitLab
+ * accepts only for a resolvable thread: a review thread the ticket settled. The GitLab skill has the worker run the same call
+ * through glab, so this is the behavior the skill's command must reproduce.
+ */
+export async function resolveGitlabDiscussion(commands: Commands, kind: GitlabKind, iid: number, discussionId: string,
+  resolved: boolean): Promise<void> {
+  await commands.gitlabApi(z.unknown(), `${objectPath(kind, iid)}/discussions/${encodeURIComponent(discussionId)}?resolved=${resolved}`,
+    '--method', 'PUT')
 }
 /** Links an address to its Issue or merge request page; without the instance's web URL, only a retained URL links. */
 export function gitlabLink(address: Record<string, string>, links: ChannelLinks): ChannelLink {

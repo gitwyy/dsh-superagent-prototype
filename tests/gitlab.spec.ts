@@ -142,6 +142,8 @@ describe('gitlab source kind', () => {
     expect(gitlabKind.scope!({ meta: { kind: 'note' } }, config)).toEqual({ listened: true, observed: true, row: 'comments' })
     expect(gitlabKind.scope!({ meta: { kind: 'discussion', ci: false } }, config)).toEqual({ listened: true, observed: true, row: 'comments' })
     expect(gitlabKind.scope!({ meta: { ci: true, branch: 'main' } }, config)).toEqual({ listened: true, observed: false, row: 'ci' })
+    // A merge request's head pipeline reaches its ticket but never originates a candidate, so it has no admission row.
+    expect(gitlabKind.scope!({ meta: { ci: true, kind: 'merge_request', iid: 5 } }, config)).toEqual({ listened: true, observed: false })
     expect(gitlabKind.scope!({ meta: {} }, config)).toEqual({ listened: true, observed: false })
     expect(gitlabKind.environment!.variables.map(variable => variable.key)).toEqual(['DSH_SUPERAGENT_GITLAB_URL',
       'DSH_SUPERAGENT_GITLAB_PROJECT', 'DSH_SUPERAGENT_GITLAB_ACCOUNT', 'DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL',

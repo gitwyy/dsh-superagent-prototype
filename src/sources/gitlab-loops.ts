@@ -1,4 +1,4 @@
-/** GitLab polling loops: pending todos, observed stream changes, default-branch CI, Ticket merge requests, and subscribed Threads. */
+/** GitLab polling loops: pending todos, observed stream changes, default-branch and merge request CI, Ticket merge requests, and subscribed Threads. */
 import { type Thread } from '../core/index.ts'
 import type { GitlabAccount, GitlabConfig } from '../deployment.ts'
 import { type Tally } from '../infra/commands.ts'
@@ -6,13 +6,20 @@ import { sameName } from '../infra/text.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, pause, POLL_HORIZON_MS, pollFailure, pollThreads as pollEach } from './poll.ts'
 import { health, type SourceContext } from './host.ts'
-import { ciFact, pipelineFailures, pipelineSummary, pipelineUnfinished, readThread, type GitlabThreadRead } from './gitlab-read.ts'
+import { ciFact, pipelineFailures, pipelineFingerprint, pipelineSummary, pipelineUnfinished, readThread, type GitlabThreadRead }
+  from './gitlab-read.ts'
 import { branchCiTrigger, gitlabThreadKey, IssueSchema, issueTrigger, JobSchema, type GitlabIssue, type GitlabJob, type GitlabKind,
-  type GitlabMergeRequest, MergeRequestSchema, mergeRequestTrigger, noteTrigger, type GitlabProject, PipelineSchema, SOURCE, TodoSchema,
-  type GitlabTodo, isTodoRequest, todoTarget, todoTrigger, type GitlabRetry } from './gitlab-trigger.ts'
+  type GitlabMergeRequest, MergeRequestSchema, mergeRequestCiTrigger, mergeRequestTrigger, noteTrigger, type GitlabProject,
+  PipelineSchema, SOURCE, TodoSchema, type GitlabTodo, isTodoRequest, todoTarget, todoTrigger, type GitlabRetry } from './gitlab-trigger.ts'
 import { mergeRequestsOf, observeMergeRequest, readMergeRequest, type MergeRequest } from './gitlab-pull.ts'
 
 const RETRY_WINDOW_MS = 24 * 3600_000
+/**
+ * How far before its todo a mention todo's Issue or merge request body may have been recorded. GitLab creates the todo a
+ * moment after the body it mentions (observed about 1.3 s), so a body read driven by the todo accepts one from just before
+ * it; the body Trigger's deterministic ID still deduplicates an overlap with the observed streams.
+ */
+const BODY_TOLERANCE_MS = 60_000
 /** The resolved project the Source watches, with what a poll needs from the account setup verified. */
 interface Project extends GitlabProject { login: string; defaultBranch: string }
 function project(ctx: SourceContext): Project {
@@ -77,8 +84,10 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
 }
 /**
  * Reads the agent's pending todos, which GitLab fills for mentions, assignments and review requests but not for ordinary
- * replies, and reads each todo's Issue or merge request since the todo. The first round records the newest todo as a
- * baseline; todos older than it are never read. Failed reads are retried for a day, and this Source never marks todos done.
+ * replies, and reads each todo's Issue or merge request since the todo. A mention todo accepts the body it mentions from
+ * shortly before the todo, since GitLab records the notification after the body; the body Trigger keeps a deterministic ID,
+ * so a read the observed streams also made is a no-op. The first round records the newest todo as a baseline; todos older
+ * than it are never read. Failed reads are retried for a day, and this Source never marks todos done.
  * @returns how many todos the round read.
  */
 async function pollTodos(ctx: SourceContext, round: Round): Promise<number> {
@@ -104,7 +113,10 @@ async function pollTodos(ctx: SourceContext, round: Round): Promise<number> {
     const target = todoTarget(todo, projectInfo, projectInfo.login)
     if (!target) { delete retries[String(todo.id)]; continue }
     try {
-      await intake(ctx, round, { kind: target.kind, iid: target.iid, since: target.since, body: true })
+      // Only a mention todo's body may have been recorded before the todo; an assignment or review request keeps its rule.
+      const mention = target.action === 'mentioned' || target.action === 'directly_addressed'
+      await intake(ctx, round, { kind: target.kind, iid: target.iid, since: target.since, body: true,
+        ...mention ? { bodyToleranceMs: BODY_TOLERANCE_MS } : {} })
       // An assignment or review request exists only as the notification, so the todo itself carries it.
       if (isTodoRequest(target.action)) await ctx.receive(todoTrigger(todo, target, projectInfo, projectInfo.login))
       delete retries[String(todo.id)]
@@ -211,7 +223,7 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
   }
   ctx.state.set(KV.gitlab.branchCi, { branch: branchName, failures: now, revision: next })
 }
-/** Reads and observes each open Ticket's merge requests; the read is shared within the round. */
+/** Reads and observes each open Ticket's merge requests, and polls the head pipeline of each still open; the read is shared within the round. */
 export async function pollTicketMergeRequests(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   const iids = [...new Set(ctx.tickets.open().flatMap(ticket => mergeRequestsOf(ticket, true)))]
   for (const iid of iids) {
@@ -219,6 +231,7 @@ export async function pollTicketMergeRequests(ctx: SourceContext, signal?: Abort
     try {
       const mr = await mergeRequest(ctx, round, iid)
       await observe(ctx, round, mr)
+      if (mr.state === 'opened') await pollMergeRequestCi(ctx, round, mr)
     } catch (error) { if (!stopped(ctx, round)) round.failures.push(`!${iid}: ${String(error)}`) }
   }
 }
@@ -227,6 +240,37 @@ function mergeRequest(ctx: SourceContext, round: Round, iid: number): Promise<Me
   let read = round.mrs.get(iid)
   if (!read) { read = readMergeRequest(ctx, iid, round.signal); round.mrs.set(iid, read) }
   return read
+}
+/**
+ * Polls an open merge request's head pipeline, which GitLab reports as the merge request's `head_pipeline` or, when it names
+ * none, the newest the merge request lists. A pipeline that is created, pending, waiting, preparing, scheduled or manual has
+ * not failed and never becomes a Trigger; only a failure, and a recovery once the pipeline finished clean, do, each with the
+ * revision that keeps its ID distinct. The first observation only records the baseline.
+ */
+async function pollMergeRequestCi(ctx: SourceContext, round: Round, mr: MergeRequest): Promise<void> {
+  const commands = ctx.commands.withSignal(round.signal)
+  const previous = ctx.state.get(KV.gitlab.ci(mr.iid))
+  const listed = await commands.gitlabPages(PipelineSchema, `merge_requests/${mr.iid}/pipelines?per_page=100`, round.tally)
+  const newest = [...listed].sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''))[0]
+  const head = mr.head_pipeline ?? newest
+  if (!head) { ctx.state.set(KV.gitlab.ci(mr.iid), previous && { ...previous, fingerprint: '', failures: [] }); return }
+  const jobs: GitlabJob[] = await commands.gitlabPages(JobSchema, `pipelines/${head.id}/jobs?per_page=100`, round.tally)
+  const snapshot = { pipeline: head, jobs }
+  const fingerprint = pipelineFingerprint(snapshot)
+  if (previous?.fingerprint === fingerprint) return
+  // Failures are retained while the pipeline they came from is still unresolved, so only its finished clean run recovers them.
+  const failures = pipelineFailures(snapshot)
+  const known = previous?.failures ?? []
+  const now = failures.length || !pipelineUnfinished(head) ? failures : known
+  const revision = previous?.revision ?? 0
+  // The baseline reports nothing, and a pending or created pipeline changes nothing an agent should answer.
+  const actionable = previous !== undefined && JSON.stringify(now) !== JSON.stringify(known)
+  const next = actionable ? revision + 1 : revision
+  ctx.state.set(KV.gitlab.ci(mr.iid), { fingerprint, failures: previous ? now : [], revision: next })
+  if (!actionable) return
+  await ctx.receive(mergeRequestCiTrigger(mr, head, project(ctx), next,
+    pipelineSummary(snapshot, `!${mr.iid}`, `gitlab/merge_requests/${mr.iid}/pipelines`)))
+  ctx.threads.describe(gitlabThreadKey('merge_request', mr.iid), { facts: { ci: ciFact(snapshot) } })
 }
 async function observe(ctx: SourceContext, round: Round, mr: MergeRequest): Promise<void> {
   if (round.observed.has(mr.iid)) return
@@ -266,15 +310,20 @@ function threadRead(ctx: SourceContext, round: Round, kind: GitlabKind, iid: num
   }
   return reading
 }
-/** Reads a conversation and emits the Triggers its new body and notes make, then moves its note cursor. */
+/**
+ * Reads a conversation and emits the Triggers its new body and notes make, then moves its note cursor. `bodyToleranceMs`
+ * lets a todo-driven read accept a body recorded slightly before the todo that points at it.
+ */
 async function intake(ctx: SourceContext, round: Round,
-  input: { kind: GitlabKind; iid: number; since: string; body: boolean; object?: GitlabIssue | GitlabMergeRequest }): Promise<void> {
+  input: { kind: GitlabKind; iid: number; since: string; body: boolean; bodyToleranceMs?: number;
+    object?: GitlabIssue | GitlabMergeRequest }): Promise<void> {
   const read = await threadRead(ctx, round, input.kind, input.iid, input.object)
   const projectInfo = project(ctx)
   if (input.body) {
     const created = Date.parse(read.object.created_at ?? '')
     const user = read.object.author
-    if (Number.isFinite(created) && created >= Date.parse(input.since) && user && !sameName(user.username, projectInfo.login)) {
+    if (Number.isFinite(created) && created >= Date.parse(input.since) - (input.bodyToleranceMs ?? 0)
+      && user && !sameName(user.username, projectInfo.login)) {
       await ctx.receive(read.kind === 'issue' ? issueTrigger(read.object as GitlabIssue, projectInfo, projectInfo.login)
         : mergeRequestTrigger(read.object as GitlabMergeRequest, projectInfo, projectInfo.login))
     }

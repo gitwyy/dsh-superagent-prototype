@@ -9,6 +9,7 @@ import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
 import { admissionContext } from '../sources/admission-context.ts'
 import { readRepositoryPath } from '../sources/github-read.ts'
+import { readGitlabRepositoryPath } from '../sources/gitlab-read.ts'
 import type { TriggerContext } from '../sources/kind.ts'
 import { relatedTickets } from './cards.ts'
 import { textPage } from './context.ts'
@@ -263,7 +264,11 @@ export class MasterAssessor implements Assessor {
         body = JSON.stringify({ images: references, next_read: next, ...result.body })
       }
       else {
-        body = await readRepositoryPath(commands, read.path!, read.resource === 'directory' ? 'directory' : 'file')
+        // Repository reads follow the deployment's VCS: a raw file, or a directory's entry names.
+        const kind = read.resource === 'directory' ? 'directory' as const : 'file' as const
+        body = commands.deployment.vcs === 'gitlab'
+          ? await readGitlabRepositoryPath(commands, read.path!, kind)
+          : await readRepositoryPath(commands, read.path!, kind)
       }
       snapshots.set(cacheKey, body)
       return textPage(read.resource, body, read.offset, 4000)

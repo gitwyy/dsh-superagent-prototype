@@ -43,6 +43,18 @@ export const recordedPipeline = { id: 9933, iid: 3, sha: '4ee36fa71cb74388b9f0d1
   status: 'pending', source: 'push', created_at: '2026-11-03T02:16:30.000Z', updated_at: '2026-11-03T02:16:31.000Z',
   web_url: `${WEB}/-/pipelines/9933`, user: { id: 92, username: BOT } }
 export const recordedJob = { id: 22368, name: 'test', stage: 'test', status: 'pending', allow_failure: false }
+/** One recorded inline diff note (`GET …/merge_requests/1/discussions`), with the position and resolution flags of a review thread. */
+export const recordedDiffNote = { ...recordedNote, id: 27738, type: 'DiffNote', body: 'Use the theme token', resolvable: true,
+  resolved: false, created_at: '2026-11-03T02:16:50.000Z', updated_at: '2026-11-03T02:16:50.000Z',
+  position: { base_sha: 'aab075ae', start_sha: 'aab075ae', head_sha: '4ee36fa7', old_path: 'src/render.ts',
+    new_path: 'src/render.ts', position_type: 'text', old_line: null, new_line: 43, line_range: null } }
+/** One recorded merge request approval read (`GET …/merge_requests/1/approvals`); this instance requires no approval. */
+export const recordedApprovals = { id: 6001, iid: 1, project_id: 480, title: '[probe] MR contract test', state: 'opened',
+  approvals_required: 0, approvals_left: 0, approved: false, approved_by: [] }
+/** One recorded branch (`GET …/repository/branches`), with the head commit a push or merge names. */
+export const recordedBranch = { name: 'main', default: true, protected: true, merged: false,
+  commit: { id: '4ee36fa71cb74388b9f0d13c0d8babffaf7e19d4', short_id: '4ee36fa7', title: 'probe: add contract test file',
+    created_at: '2026-11-03T02:16:25.000Z' } }
 
 /** The user GitLab reports for the agent account; only `GET /user` carries `bot`. */
 export const botUser = { id: 92, username: BOT, name: 'superagent-bot', bot: true }
@@ -56,6 +68,11 @@ export const note = (id: number, body: string, overrides: Record<string, unknown
   const created = typeof overrides.created_at === 'string' ? overrides.created_at : `2026-09-09T00:00:0${id % 10}Z`
   return { ...recordedNote, id, body, created_at: created, updated_at: created, ...overrides }
 }
+/** An inline diff note with its file, line and resolution flags; `overrides` may move it or resolve it. */
+export const diffNote = (id: number, body: string, overrides: Record<string, unknown> = {}) => {
+  const created = typeof overrides.created_at === 'string' ? overrides.created_at : `2026-11-03T02:16:5${id % 10}.000Z`
+  return { ...recordedDiffNote, id, body, created_at: created, updated_at: created, ...overrides }
+}
 export const systemNote = (id: number, body: string, overrides: Record<string, unknown> = {}) =>
   ({ ...recordedSystemNote, id, body, ...overrides })
 export const discussion = (id: string, notes: unknown[], individual = false) => ({ id, individual_note: individual, notes })
@@ -65,6 +82,14 @@ export const pipeline = (id: number, status: string, overrides: Record<string, u
   ({ ...recordedPipeline, id, status, user: botUser, ...overrides })
 export const job = (id: number, name: string, status: string, overrides: Record<string, unknown> = {}) =>
   ({ ...recordedJob, id, name, status, ...overrides })
+/** An approval read for a merge request; `overrides` names approvers or required approvals. */
+export const approvals = (iid: number, overrides: Record<string, unknown> = {}) => ({ ...recordedApprovals, iid, ...overrides })
+/** An entry of a repository directory (`GET …/repository/tree`), which is a `blob` or a `tree`. */
+export const treeEntry = (name: string, type: 'blob' | 'tree' = 'blob', path = name) =>
+  ({ id: `sha-${name}`, name, type, path, mode: type === 'tree' ? '040000' : '100644' })
+/** A branch of the project; `overrides` may make it the default or protect it. */
+export const branch = (name: string, overrides: Record<string, unknown> = {}) =>
+  ({ ...recordedBranch, name, default: name === 'main', protected: name === 'main', ...overrides })
 
 /** A resolved GitLab deployment of `acme/widgets` on `gitlab.example.com`, for commands and Source contexts. */
 export const gitlabAccount = (overrides: Partial<GitlabAccount> = {}): GitlabAccount => ({ cli: '/path/agent-glab',

@@ -51,14 +51,15 @@ export const KV = {
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:') },
   /**
    * GitLab Source: the pending-todo cursor (the newest todo id seen, and when polling started) with the reads it retries;
-   * per-Thread note cursor; per-stream cursor and start times by kind; and default-branch CI's failure baseline with the
-   * revision its Trigger IDs count.
+   * per-Thread note cursor; per-stream cursor and start times by kind; default-branch CI's failure baseline with the
+   * revision its Trigger IDs count; and a merge request's head-pipeline fingerprint with the failures it last reported.
    */
   gitlab: { todos: record<{ maxId: number; startedAt?: string }>('gitlab-todos'),
     retries: record<Record<string, GitlabRetry>>('gitlab-retry'),
     cursor: family<string, [thread: string]>('gitlab-cursor:'),
     stream: family<{ since: string; started: string }, [stream: string]>('gitlab-stream:'),
-    branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('gitlab-branch-ci') },
+    branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('gitlab-branch-ci'),
+    ci: family<{ fingerprint: string; failures?: string[]; revision: number }, [number: number]>('gitlab-ci:') },
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.

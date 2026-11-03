@@ -1,10 +1,10 @@
-/** Read-only GitLab issue, merge request, discussion, and pipeline inspection for assessments and workers. */
+/** Read-only GitLab issue, merge request, discussion, pipeline, repository, and approval inspection for assessments and workers. */
 import { z } from 'zod'
 import type { ThreadFact } from '../core/index.ts'
 import { CliError, validItems, type Commands, type Tally } from '../infra/commands.ts'
 import { descriptionMessageId, DiscussionSchema, IssueSchema, JobSchema, MergeRequestSchema, noteMessageId, notePlace, NoteSchema,
   noteText, PipelineSchema, type GitlabIssue, type GitlabJob, type GitlabKind, type GitlabMergeRequest, type GitlabNote,
-  type GitlabPipeline, isHuman } from './gitlab-trigger.ts'
+  type GitlabPipeline, GitlabUserSchema, isHuman } from './gitlab-trigger.ts'
 import type { ContextMessage, ThreadContext } from './kind.ts'
 
 /** Everything a polling round reads of one conversation: its Issue or merge request, its discussions, and their notes. */
@@ -23,6 +23,58 @@ export const readMergeRequest = (commands: Commands, iid: number): Promise<Gitla
 export const readPipeline = (commands: Commands, id: number): Promise<GitlabPipeline> => commands.gitlabApi(PipelineSchema, `pipelines/${id}`)
 export const readPipelineJobs = (commands: Commands, id: number, tally?: Tally): Promise<GitlabJob[]> =>
   commands.gitlabPages(JobSchema, `pipelines/${id}/jobs?per_page=100`, tally)
+/** An entry of a repository directory (`GET …/repository/tree`); `type` is `tree` for a directory and `blob` for a file. */
+export const TreeEntrySchema = z.looseObject({ id: z.string().nullish(), name: z.string(), type: z.string().nullish(), path: z.string().nullish() })
+export type GitlabTreeEntry = z.infer<typeof TreeEntrySchema>
+/** A branch of the project; `commit` names its head, which a worker reads before pushing or merging. */
+export const BranchSchema = z.looseObject({ name: z.string(), default: z.boolean().nullish(), protected: z.boolean().nullish(),
+  merged: z.boolean().nullish(), commit: z.looseObject({ id: z.string(), short_id: z.string().nullish(), title: z.string().nullish(),
+    created_at: z.string().nullish() }).nullish() })
+export type GitlabBranch = z.infer<typeof BranchSchema>
+/**
+ * A merge request's approval state. GitLab serves it only in tiers that have approvals enabled: the endpoint answers 403 or
+ * 404 elsewhere, which is "unsupported", never a failed read.
+ */
+export const ApprovalsSchema = z.looseObject({ id: z.number().nullish(), iid: z.number().nullish(), project_id: z.number().nullish(),
+  title: z.string().nullish(), state: z.string().nullish(), approvals_required: z.number().nullish(), approvals_left: z.number().nullish(),
+  approved: z.boolean().nullish(), approved_by: z.array(z.looseObject({ user: GitlabUserSchema.nullish() })).nullish() })
+export type GitlabApprovals = z.infer<typeof ApprovalsSchema>
+/** What a merge request's approval read found, or that this GitLab refuses to report approvals at all. */
+export type ApprovalRead = { supported: false } | { supported: true; approvals_required: number; approvals_left: number;
+  approved: boolean; approved_by: string[] }
+/** Reads the approval state read-only, degrading to `supported: false` on the 403/404 a GitLab without approvals answers. */
+export async function readMergeRequestApprovals(commands: Commands, iid: number): Promise<ApprovalRead> {
+  try {
+    const item = await commands.gitlabApi(ApprovalsSchema, `${mergeRequestPath(iid)}/approvals`)
+    return { supported: true, approvals_required: item.approvals_required ?? 0, approvals_left: item.approvals_left ?? 0,
+      approved: item.approved ?? false, approved_by: (item.approved_by ?? []).flatMap(entry => entry.user?.username ? [entry.user.username] : []) }
+  } catch (error) {
+    if (error instanceof CliError && (error.code === 403 || error.code === 404)) return { supported: false }
+    throw error
+  }
+}
+/** The branch repository reads use: the project's default branch, or `HEAD` when setup recorded none. */
+const defaultRef = (commands: Commands): string => commands.deployment.gitlab?.defaultBranch || 'HEAD'
+/** A repository path as its parts, refusing hidden entries, parent references and dependencies as GitHub's repository reads do. */
+function repositoryParts(path: string): string[] {
+  const parts = path.split('/').filter(part => part && part !== '.')
+  if (parts.some(part => part === '..' || part.startsWith('.') || part === 'node_modules')) throw new Error('Only non-hidden repository source paths are available')
+  return parts
+}
+/** The API path of a directory listing, whose `path` parameter is omitted at the repository root. */
+const treePath = (parts: string[], ref: string): string =>
+  `${parts.length ? `repository/tree?path=${encodeURIComponent(parts.join('/'))}&ref=` : 'repository/tree?ref='}${encodeURIComponent(ref)}&per_page=100`
+/**
+ * Reads a non-hidden repository file's raw text or a directory's entry names (sorted, one per line) from the project's
+ * default branch, as GitHub's repository reads answer; assessments use it for a GitLab deployment.
+ */
+export async function readGitlabRepositoryPath(commands: Commands, path: string, kind: 'file' | 'directory'): Promise<string> {
+  const parts = repositoryParts(path)
+  const ref = defaultRef(commands)
+  if (kind === 'file') return commands.gitlabApi(`repository/files/${encodeURIComponent(parts.join('/'))}/raw?ref=${encodeURIComponent(ref)}`)
+  const entries = await commands.gitlabPages(TreeEntrySchema, treePath(parts, ref))
+  return entries.map(entry => entry.name).filter(name => !name.startsWith('.') && name !== 'node_modules').sort().join('\n')
+}
 /** The discussions of an Issue or merge request; an issue discussions 404 falls back to its notes, grouped individually. */
 export async function readDiscussions(commands: Commands, kind: GitlabKind, iid: number, tally?: Tally): Promise<{ id: string; notes: GitlabNote[] }[]> {
   try {
@@ -75,12 +127,15 @@ async function discussionPage(commands: Commands, kind: GitlabKind, iid: number,
     return { notes, complete: listed.length < 100 }
   }
 }
+/** A conversation message, which also names the discussion a reply must use and whether that thread can be and is resolved. */
+export interface GitlabContextMessage extends ContextMessage { discussion?: string; resolvable?: boolean; resolved?: boolean }
 /** The file:line prefix of a diff note, so a reply in its discussion reads in place. */
-function noteMessage(note: GitlabNote, webUrl: string, login: string, replyTo?: string): ContextMessage {
+function noteMessage(note: GitlabNote, webUrl: string, login: string, replyTo?: string, discussion?: string): GitlabContextMessage {
   const place = notePlace(note)
   return { id: noteMessageId(note.id), from: note.author?.username ?? '', at: note.created_at ?? note.updated_at ?? '',
     text: noteText(note), ...note.author && !isHuman(note.author, login) ? { bot: true as const } : {},
-    ...webUrl ? { url: `${webUrl}#note_${note.id}` } : {}, ...place ?? {}, ...replyTo ? { reply_to: replyTo } : {} }
+    ...webUrl ? { url: `${webUrl}#note_${note.id}` } : {}, ...place ?? {}, ...replyTo ? { reply_to: replyTo } : {},
+    ...discussion ? { discussion } : {}, ...note.resolvable ? { resolvable: true, resolved: note.resolved === true } : {} }
 }
 /** The description of an Issue or merge request as a message, whose id names the description rather than a note. */
 function objectMessage(object: GitlabIssue | GitlabMergeRequest, kind: GitlabKind, webUrl: string, login: string): ContextMessage {
@@ -95,8 +150,8 @@ export const gitlabThreadContext: ThreadContext<unknown> = {
     return target?.noteId ? noteMessageId(target.noteId) : descriptionMessageId(target?.kind ?? 'issue', target?.iid ?? 0)
   },
   read: async (commands, trigger, part, cursor) => {
-    // The default branch's CI has no conversation; its Trigger is its context.
-    if (trigger.meta.ci === true) {
+    // The default branch's CI has no conversation; its Trigger is its context. A merge request's CI does have one.
+    if (trigger.meta.ci === true && typeof trigger.meta.branch === 'string') {
       const message = { id: trigger.url ?? trigger.id, from: 'CI', at: trigger.at, text: trigger.text, bot: true as const }
       return { messages: [message], body: { status: 'branch_ci', messages: [message] }, status: 'branch_ci' }
     }
@@ -119,7 +174,7 @@ export const gitlabThreadContext: ThreadContext<unknown> = {
       const visible = notes.filter(note => note.system !== true)
       if (visible.length) {
         const [first] = visible
-        const messages = visible.flatMap(note => [noteMessage(note, webUrl, login, note === first ? undefined : noteMessageId(first!.id))])
+        const messages = visible.flatMap(note => [noteMessage(note, webUrl, login, note === first ? undefined : noteMessageId(first!.id), target.discussionId)])
         const shown = part === 'parent' ? messages.slice(0, 1) : messages
         return { messages: shown, body: { status: 'discussion_thread', messages: shown }, status: 'discussion_thread' }
       }
@@ -138,8 +193,8 @@ export const gitlabThreadContext: ThreadContext<unknown> = {
       messages.push(objectMessage(object, target.kind, webUrl, login))
     }
     const listed = await discussionPage(commands, target.kind, target.iid, page)
-    for (const { note, replyTo } of listed.notes) {
-      const message = noteMessage(note, webUrl, login, replyTo)
+    for (const { note, replyTo, discussionId } of listed.notes) {
+      const message = noteMessage(note, webUrl, login, replyTo, discussionId)
       if (message.text) messages.push(message)
     }
     const next = listed.complete ? undefined : String(page + 1)
@@ -187,11 +242,48 @@ export function ciFact(snapshot: PipelineSnapshot): ThreadFact {
   return { label: 'CI', value: { zh: '通过', en: 'passed' } }
 }
 
+/** One branch as the repository resource reports it, with the head commit a push or merge names. */
+const branchView = (branch: GitlabBranch) => ({ name: branch.name, default: branch.default === true, protected: branch.protected === true,
+  ...branch.merged === true ? { merged: true } : {},
+  ...branch.commit ? { commit: { id: branch.commit.id, short_id: branch.commit.short_id ?? branch.commit.id.slice(0, 8),
+    title: branch.commit.title ?? '' } } : {} })
 /**
- * Reads an Issue, a merge request, a page of its notes or discussions, its pipelines, or one pipeline's jobs as model-facing
- * messages and facts rather than raw GitLab API records; the `gitlab/` resources the skills describe.
+ * Serves the project's read-only repository facts: its default branch, a raw file, a directory listing, and its branches. A
+ * path stays inside the project and never names a hidden entry or a dependency, as the assessment's repository reads require.
+ */
+async function readRepositoryResource(commands: Commands, section: string | undefined, rest: string | undefined): Promise<unknown> {
+  const project = commands.deployment.gitlab
+  if (!project) throw new Error('The GitLab Source has no working GitLab account')
+  const ref = defaultRef(commands)
+  if (!section) {
+    return { project: project.project, project_id: project.projectId, default_branch: project.defaultBranch || '', ref, web_url: project.webUrl }
+  }
+  if (section === 'files') {
+    if (!rest) throw new Error('Name the file: gitlab/repository/files/<path>')
+    const parts = repositoryParts(rest)
+    return { path: parts.join('/'), ref, content: await readGitlabRepositoryPath(commands, rest, 'file') }
+  }
+  if (section === 'tree') {
+    const path = rest ? repositoryParts(rest).join('/') : ''
+    const names = await readGitlabRepositoryPath(commands, path, 'directory')
+    return { path: path || '.', ref, entries: names ? names.split('\n') : [] }
+  }
+  if (section === 'branches') {
+    if (!rest) return { default_branch: project.defaultBranch || '',
+      branches: (await commands.gitlabPages(BranchSchema, 'repository/branches?per_page=100')).map(branchView) }
+    return branchView(await commands.gitlabApi(BranchSchema, `repository/branches/${encodeURIComponent(rest)}`))
+  }
+  throw new Error('Use gitlab/repository, gitlab/repository/files/<path>, gitlab/repository/tree/<path>, or gitlab/repository/branches[/<name>]')
+}
+
+/**
+ * Reads an Issue, a merge request, a page of its notes or discussions, its pipelines, approvals or pipeline jobs, or the
+ * project's repository files, trees and branches as model-facing messages and facts rather than raw GitLab API records; the
+ * `gitlab/` resources the skills describe.
  */
 export async function readGitlab(commands: Commands, resource: string): Promise<unknown> {
+  const repository = /^gitlab\/repository(?:\/([^/]+)(?:\/(.+))?)?$/.exec(resource)
+  if (repository) return readRepositoryResource(commands, repository[1], repository[2])
   const jobs = /^gitlab\/pipelines\/(\d+)\/jobs$/.exec(resource)
   if (jobs) {
     const pipeline = await readPipeline(commands, Number(jobs[1]))
@@ -205,9 +297,9 @@ export async function readGitlab(commands: Commands, resource: string): Promise<
     return { id: item.id, iid: item.iid, sha: item.sha, ref: item.ref, status: item.status, source: item.source,
       web_url: item.web_url, created_at: item.created_at, updated_at: item.updated_at }
   }
-  const match = /^gitlab\/(issues|merge_requests)\/([1-9]\d*)(?:\/(notes|discussions|pipelines)(?:\/([1-9]\d*))?)?$/.exec(resource)
+  const match = /^gitlab\/(issues|merge_requests)\/([1-9]\d*)(?:\/(notes|discussions|pipelines|approvals)(?:\/([1-9]\d*))?)?$/.exec(resource)
   if (!match) {
-    throw new Error('Use gitlab/issues/<iid>, gitlab/merge_requests/<iid>, or append /notes/<page>, /discussions/<page> or /pipelines; or gitlab/pipelines/<id>[/jobs]')
+    throw new Error('Use gitlab/issues/<iid>, gitlab/merge_requests/<iid>, or append /notes/<page>, /discussions/<page>, /pipelines or /approvals; or gitlab/pipelines/<id>[/jobs]; or gitlab/repository[...]')
   }
   const [, listed, iidText, section, pageText = '1'] = match
   const kind: GitlabKind = listed === 'issues' ? 'issue' : 'merge_request'
@@ -230,6 +322,12 @@ export async function readGitlab(commands: Commands, resource: string): Promise<
       ...mr.head_pipeline ? { head_pipeline: { id: mr.head_pipeline.id, status: mr.head_pipeline.status, sha: mr.head_pipeline.sha } } : {},
       ...mr.has_conflicts ? { has_conflicts: true } : {}, ...mr.draft ? { draft: true } : {}, ...message }
   }
+  if (section === 'approvals') {
+    if (kind === 'issue') throw new Error('Approvals require a merge request')
+    if (match[4]) throw new Error('Approvals do not take a page number')
+    // A GitLab whose tier has no approvals answers 403/404; that is reported as unsupported, not as a failed read.
+    return await readMergeRequestApprovals(commands, iid)
+  }
   if (section === 'pipelines') {
     if (match[4]) throw new Error('Pipelines do not take a page number')
     const pipelines = await commands.gitlabPages(PipelineSchema, `${mergeRequestPath(iid)}/pipelines?per_page=100`)
@@ -239,8 +337,8 @@ export async function readGitlab(commands: Commands, resource: string): Promise<
   const page = Number(pageText)
   const tally = { skipped: 0 }
   const listedPage = await discussionPage(commands, kind, iid, page, tally)
-  const messages = listedPage.notes.flatMap(({ note, replyTo }) => {
-    const message = noteMessage(note, '', login, replyTo)
+  const messages = listedPage.notes.flatMap(({ note, replyTo, discussionId }) => {
+    const message = noteMessage(note, '', login, replyTo, discussionId)
     return message.text ? [message] : []
   })
   return { messages, ...tally.skipped ? { skipped: tally.skipped } : {},

@@ -28,10 +28,17 @@ export const descriptionMessageId = (kind: GitlabKind, iid: number): string => `
 /** The hidden HTML comment that marks a reply the channel posted, so a retried send finds it instead of posting twice. */
 export const marker = (messageId: string): string => `<!-- dsh-superagent:${messageId} -->`
 export const hasMarker = (text: string, messageId: string): boolean => text.includes(marker(messageId))
-/** GitLab's reply address: an Issue's or merge request's conversation, or one of its discussions when known. */
-export const gitlabChannel = (kind: GitlabKind, iid: number, project: string, url?: string, discussionId?: string): ChannelRef =>
+/** Where a diff note sits in its merge request's diff; an inline reply keeps the place so it lands on the same line. */
+export interface GitlabPlace { path: string; line?: number; side?: 'new' | 'old' }
+/**
+ * GitLab's reply address: an Issue's or merge request's conversation, one of its discussions when known, and a diff note's
+ * file and line when the Trigger came from one, which a reply needs to open a new inline thread on the same place.
+ */
+export const gitlabChannel = (kind: GitlabKind, iid: number, project: string, url?: string, discussionId?: string,
+  place?: GitlabPlace): ChannelRef =>
   ({ source: SOURCE, thread: gitlabThreadKey(kind, iid), address: { project, kind, iid: String(iid),
-    ...(url ? { url } : {}), ...(discussionId ? { discussionId } : {}) } })
+    ...(url ? { url } : {}), ...(discussionId ? { discussionId } : {}),
+    ...(place ? { path: place.path, ...place.line != null ? { line: String(place.line) } : {}, ...place.side ? { side: place.side } : {} } : {}) } })
 
 export const GitlabUserSchema = z.looseObject({ id: z.number().optional(), username: z.string(), name: z.string().nullish(),
   bot: z.boolean().nullish(), state: z.string().nullish() })
@@ -128,8 +135,8 @@ export const isTodoRequest = (action: string): boolean => REQUEST_ACTIONS.has(ac
 const author = (user: GitlabUser | null | undefined, agent: string, id: string) =>
   ({ actor: { source: SOURCE, id: user?.username ?? id }, human: !!user && isHuman(user, agent) })
 const timeOf = (...times: (string | null | undefined)[]): string => times.find(Boolean) ?? new Date().toISOString()
-const channelOf = (kind: GitlabKind, iid: number, project: GitlabProject, url?: string, discussionId?: string): ChannelRef =>
-  gitlabChannel(kind, iid, project.project, url, discussionId)
+const channelOf = (kind: GitlabKind, iid: number, project: GitlabProject, url?: string, discussionId?: string,
+  place?: GitlabPlace): ChannelRef => gitlabChannel(kind, iid, project.project, url, discussionId, place)
 /** Stable ID of a new Issue's body; an edit changes nothing, so the same body is never ingested twice. */
 export const issueTriggerId = (todoProjectId: number | null | undefined, iid: number, createdAt: string | null | undefined): string =>
   key('gitlab-issue', String(todoProjectId ?? ''), String(iid), createdAt ?? '')
@@ -176,6 +183,9 @@ export function mergeRequestTrigger(mr: GitlabMergeRequest, project: GitlabProje
 }
 /** Where a note lives: its thread, the page its Trigger opens, and the discussion it belongs to when the read grouped it. */
 export interface NoteRef { kind: GitlabKind; iid: number; webUrl?: string; discussionId?: string }
+/** The side of the diff a note comments on: the new lines unless GitLab names only an old one. */
+const noteSide = (note: GitlabNote): GitlabPlace['side'] | undefined =>
+  note.position ? (note.position.new_line != null ? 'new' : note.position.old_line != null ? 'old' : undefined) : undefined
 /**
  * Builds the Trigger for one note of an Issue or merge request. GitLab's system notes (assignment, review requests,
  * resolution, merge references) are not messages from a person, and the agent's own notes are not requests to it, so neither
@@ -188,14 +198,16 @@ export function noteTrigger(note: GitlabNote, ref: NoteRef, project: GitlabProje
   // An empty note without a file position says nothing; a diff note without a body still points at code the agent must read.
   if (!text) return undefined
   const url = ref.webUrl ? `${ref.webUrl}#note_${note.id}` : undefined
-  const place = notePlace(note)
+  const placed = notePlace(note)
+  const side = noteSide(note)
+  const place = placed && { ...placed, ...side ? { side } : {} }
   return { id: noteTriggerId(note.project_id ?? project.projectId, note.id, note.updated_at ?? note.created_at), source: SOURCE,
     threads: [gitlabThread(ref.kind, ref.iid)], ...author(note.author, agent, ''), at: timeOf(note.updated_at, note.created_at),
     text, ...(mentions(note.body ?? '', agent) ? { addressed: 'mention' as const } : {}),
-    channel: channelOf(ref.kind, ref.iid, project, url, ref.discussionId), ...(url ? { url } : {}),
+    channel: channelOf(ref.kind, ref.iid, project, url, ref.discussionId, place), ...(url ? { url } : {}),
     meta: { kind: 'note', targetKind: ref.kind, iid: ref.iid, projectId: project.projectId, project: project.project,
       noteId: note.id, ...(ref.webUrl ? { webUrl: ref.webUrl } : {}), ...(ref.discussionId ? { discussionId: ref.discussionId } : {}),
-      ...(note.type ? { noteType: note.type } : {}), ...place ? { path: place.path, line: place.line ?? null } : {},
+      ...(note.type ? { noteType: note.type } : {}), ...placed ? { path: placed.path, line: placed.line ?? null } : {},
       ...(note.resolvable ? { resolvable: true, resolved: note.resolved === true } : {}) } }
 }
 /**
@@ -220,4 +232,18 @@ export function branchCiTrigger(branch: string, pipeline: GitlabPipeline, revisi
     threads: [{ source: SOURCE, id: `ci:${branch}` }], actor: { source: SOURCE, id: '' }, human: false,
     at: timeOf(pipeline.updated_at, pipeline.created_at), text: summary, ...(url ? { url } : {}),
     meta: { ci: true, branch, sha: pipeline.sha, revision, pipelineId: pipeline.id } }
+}
+/**
+ * Builds the Trigger for a change of a merge request's head pipeline. CI has no person behind it, so its actor id is empty,
+ * and the change reaches the Ticket bound to the merge request's Thread, where a reply may still be posted. Its `ci` meta
+ * names no `branch`, so it is listened to without being observed: a CI change never originates a candidate, and the Policy's
+ * `ci` row stays the default branch's.
+ */
+export function mergeRequestCiTrigger(mr: Pick<GitlabMergeRequest, 'iid' | 'web_url'>, pipeline: GitlabPipeline,
+  project: GitlabProject, revision: number, summary: string): Trigger {
+  const url = pipeline.web_url ?? mr.web_url ?? gitlabPage('merge_request', mr.iid, project)
+  return { id: key('gitlab-ci', `mr:${mr.iid}`, String(revision)), source: SOURCE, threads: [gitlabThread('merge_request', mr.iid)],
+    actor: { source: SOURCE, id: '' }, human: false, at: timeOf(pipeline.updated_at, pipeline.created_at), text: summary,
+    channel: channelOf('merge_request', mr.iid, project, mr.web_url ?? undefined), ...(url ? { url } : {}),
+    meta: { ci: true, kind: 'merge_request', iid: mr.iid, revision, pipelineId: pipeline.id, sha: pipeline.sha } }
 }

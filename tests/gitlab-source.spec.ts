@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
@@ -13,16 +13,17 @@ import { sourceContextOf, type SourceContextDeps } from '../src/app/source-conte
 import { executorTools } from '../src/app/tools/executor.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { SOURCE, gitlabKind } from '../src/sources/gitlab.ts'
-import { gitlabThreadContext, readGitlab, pipelineFailures, pipelineFingerprint, pipelineSummary, ciFact, pipelineRunning }
-  from '../src/sources/gitlab-read.ts'
+import { gitlabThreadContext, readGitlab, readGitlabRepositoryPath, pipelineFailures, pipelineFingerprint, pipelineSummary, ciFact,
+  pipelineRunning } from '../src/sources/gitlab-read.ts'
+import { resolveGitlabDiscussion } from '../src/sources/gitlab-channel.ts'
 import { claimMergeRequest, mergeRequestEndNotices, mergeRequestOf, mergeRequestsOf, mergeStatusFact, observeMergeRequest, ticketBranch }
   from '../src/sources/gitlab-pull.ts'
 import { branchCiTrigger, descriptionMessageId, gitlabChannel, gitlabPage, gitlabThread, gitlabThreadKey, hasMarker, issueTrigger,
-  issueTriggerId, isBot, mentions, mergeRequestTrigger, noteMessageId, noteTrigger, noteTriggerId, todoTarget, todoTrigger,
-  TODO_ACTIONS } from '../src/sources/gitlab-trigger.ts'
+  issueTriggerId, isBot, mentions, mergeRequestCiTrigger, mergeRequestTrigger, noteMessageId, noteTrigger, noteTriggerId, todoTarget,
+  todoTrigger, TODO_ACTIONS } from '../src/sources/gitlab-trigger.ts'
 import { pollRound, pollThreads, runGitlab } from '../src/sources/gitlab-loops.ts'
-import { BOT, discussion, gitlabAccount, gitlabDeployment, issue, job, mergeRequest, note, person, pipeline, projectRef,
-  systemNote, todo, WEB } from './fixtures/gitlab.ts'
+import { approvals, BOT, branch as branchFixture, diffNote, discussion, gitlabAccount, gitlabDeployment, issue, job, mergeRequest, note,
+  person, pipeline, projectRef, systemNote, todo, treeEntry, WEB } from './fixtures/gitlab.ts'
 
 const opened: Store[] = []
 const directory = () => mkdtempSync(join(tmpdir(), 'gitlab-source-'))
@@ -49,25 +50,29 @@ function host(overrides: Partial<SourceContextDeps> = {}, config: Record<string,
   return { ...value, ...context, health: board.all, store, engine, commands, receive, executor, sources, board }
 }
 const refused = (code: number, message: string) => commandError({ stderr: `glab: HTTP ${code}`, stdout: JSON.stringify({ message }), code: 1 })
-/** Stubs `glab api` against project `acme/widgets`, returning the API paths it was asked for. */
+/** Stubs `glab api` against project `acme/widgets`, returning the API paths it was asked for and the JSON bodies it sent. */
 function gitlab(h: ReturnType<typeof host>, routes: Record<string, unknown>, shared = false) {
   const calls: string[][] = []
+  const bodies: unknown[] = []
   const answer = async (_program: string, args: string[]): Promise<string> => {
     calls.push(args)
+    const inputAt = args.indexOf('--input')
+    if (inputAt >= 0) bodies.push(JSON.parse(readFileSync(args[inputAt + 1]!, 'utf8')) as unknown)
     const path = args[1]!.replace(/^projects\/acme%2Fwidgets\/?/, '').split('?')[0]!
     const route = routes[path]
     const value = typeof route === 'function' ? (route as (args: string[]) => unknown)(args) : route
     if (value instanceof Error) throw value
     if (value === undefined) {
       if (args.includes('--paginate')) return '[]'
-      throw refused(404, '404 Not found')
+      throw refused(404, `404 Not found: ${path}`)
     }
-    return JSON.stringify(value)
+    // A raw answer, such as a repository file's text, is returned as printed; everything else is JSON.
+    return typeof value === 'string' ? value : JSON.stringify(value)
   }
   // A read bound to an abort signal goes through a Commands built by `withSignal`, so those tests stub the prototype.
   if (shared) vi.spyOn(Commands.prototype, 'run').mockImplementation(answer)
   else vi.spyOn(h.commands, 'run').mockImplementation(answer)
-  return { calls, paths: (): string[] => calls.map(args => args[1]!.replace(/^projects\/acme%2Fwidgets\/?/, '').split('?')[0]!) }
+  return { calls, bodies, paths: (): string[] => calls.map(args => args[1]!.replace(/^projects\/acme%2Fwidgets\/?/, '').split('?')[0]!) }
 }
 const executed = (name: string) => ({ name, directory: `/w/${name}`, assignment: '' })
 const openTicket = (id: string): Ticket => ({ id, title: id, decisionId: `d-${id}`, mandate: { strength: 'explicit', policyVersion: '',
@@ -120,6 +125,11 @@ describe('gitlab triggers', () => {
       position: { new_path: 'src/render.ts', new_line: 43, position_type: 'text' } }), { kind: 'merge_request', iid: 1 }, projectRef(), 'agent-bot')!
     expect(diff.text).toBe('src/render.ts:43\n\nUse the theme token')
     expect(diff.meta).toMatchObject({ path: 'src/render.ts', line: 43, noteType: 'DiffNote', targetKind: 'merge_request' })
+    // The reply address keeps the diff note's place, so a reply can land inline on the same line.
+    expect(diff.channel?.address).toMatchObject({ project: 'acme/widgets', kind: 'merge_request', iid: '1', path: 'src/render.ts', line: '43', side: 'new' })
+    const old = noteTrigger(note(27739, 'Removed line', { type: 'DiffNote', position: { old_path: 'src/render.ts', old_line: 7 } }),
+      { kind: 'merge_request', iid: 1 }, projectRef(), 'agent-bot')!
+    expect(old.channel?.address).toMatchObject({ path: 'src/render.ts', line: '7', side: 'old' })
     const first = noteTrigger(note(6, 'x', { updated_at: '2026-09-09T00:00:01Z' }), { kind: 'issue', iid: 3 }, projectRef(), 'agent-bot')!
     const edited = noteTrigger(note(6, 'x', { updated_at: '2026-09-09T00:00:02Z' }), { kind: 'issue', iid: 3 }, projectRef(), 'agent-bot')!
     expect(edited.id).not.toBe(first.id)
@@ -270,6 +280,56 @@ describe('gitlab thread context and reads', () => {
     // A failed pipeline whose failures are all allowed still counts as one failed pipeline, not a pass.
     expect(pipelineFailures({ pipeline: pipeline(9, 'failed'), jobs: [job(1, 'docs', 'failed', { allow_failure: true })] })).toEqual(['pipeline'])
   })
+  it('reads a merge request CI trigger as the merge request\'s conversation, not as a default-branch pipeline', async () => {
+    const h = host()
+    gitlab(h, { 'merge_requests/1': mergeRequest(1, { author: person() }), 'merge_requests/1/discussions': [] })
+    const trigger = mergeRequestCiTrigger(mergeRequest(1, { author: person() }), pipeline(102, 'failed'), projectRef(), 1, 'CI failed')
+    const read = await gitlabThreadContext.read(h.commands, trigger, 'thread', undefined, {})
+    expect(read.messages.map(item => item.id)).toEqual(['merge_request:1'])
+    expect(read.status).toBeUndefined()
+  })
+})
+
+describe('gitlab repository and approval reads', () => {
+  it('reads the project\'s default branch, a raw file, a directory listing and its branches', async () => {
+    const h = host()
+    gitlab(h, {
+      'repository/files/src%2Fapp.ts/raw': 'export const value = 1\n',
+      'repository/tree': [treeEntry('render.ts'), treeEntry('app.ts'), treeEntry('.env'), treeEntry('node_modules', 'tree')],
+      'repository/branches': [branchFixture('main'), branchFixture('agent/fix-title', { protected: false })],
+      'repository/branches/agent%2Ffix-title': branchFixture('agent/fix-title', { protected: false, default: false }),
+    })
+    expect(await readGitlab(h.commands, 'gitlab/repository')).toMatchObject({ project: 'acme/widgets', project_id: 7,
+      default_branch: 'main', ref: 'main' })
+    expect(await readGitlab(h.commands, 'gitlab/repository/files/src/app.ts')).toEqual({ path: 'src/app.ts', ref: 'main',
+      content: 'export const value = 1\n' })
+    expect(await readGitlab(h.commands, 'gitlab/repository/tree/src')).toEqual({ path: 'src', ref: 'main', entries: ['app.ts', 'render.ts'] })
+    expect(await readGitlab(h.commands, 'gitlab/repository/branches')).toMatchObject({ default_branch: 'main',
+      branches: [{ name: 'main', default: true, protected: true, commit: { short_id: '4ee36fa7' } },
+        { name: 'agent/fix-title', default: false, protected: false }] })
+    expect(await readGitlab(h.commands, 'gitlab/repository/branches/agent/fix-title'))
+      .toMatchObject({ name: 'agent/fix-title', default: false, protected: false })
+    // The same reads answer the assessment's file and directory resources, as GitHub's repository reads do.
+    expect(await readGitlabRepositoryPath(h.commands, 'src/app.ts', 'file')).toBe('export const value = 1\n')
+    expect(await readGitlabRepositoryPath(h.commands, 'src', 'directory')).toBe('app.ts\nrender.ts')
+    await expect(readGitlab(h.commands, 'gitlab/repository/files/.env')).rejects.toThrow('Only non-hidden repository source paths are available')
+    await expect(readGitlab(h.commands, 'gitlab/repository/nope')).rejects.toThrow('Use gitlab/repository')
+  })
+  it('reads approvals, and reports the 403/404 a GitLab without approvals answers as unsupported without failing', async () => {
+    const h = host()
+    gitlab(h, { 'merge_requests/1/approvals': approvals(1) })
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/1/approvals')).toEqual({ supported: true, approvals_required: 0,
+      approvals_left: 0, approved: false, approved_by: [] })
+    gitlab(h, { 'merge_requests/1/approvals': approvals(1, { approvals_required: 2, approvals_left: 1, approved_by: [{ user: person('carol') }] }) })
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/1/approvals')).toMatchObject({ supported: true, approvals_required: 2,
+      approvals_left: 1, approved_by: ['carol'] })
+    gitlab(h, { 'merge_requests/1/approvals': refused(404, '404 Not Found') })
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/1/approvals')).toEqual({ supported: false })
+    gitlab(h, { 'merge_requests/1/approvals': refused(403, '403 Forbidden') })
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/1/approvals')).toEqual({ supported: false })
+    await expect(readGitlab(h.commands, 'gitlab/issues/1/approvals')).rejects.toThrow('Approvals require a merge request')
+    await expect(readGitlab(h.commands, 'gitlab/merge_requests/1/approvals/1')).rejects.toThrow('Approvals do not take a page number')
+  })
 })
 
 describe('gitlab channel', () => {
@@ -321,6 +381,127 @@ describe('gitlab channel', () => {
     expect(gitlabKind.channel!.allowed!({ ...address(), kind: 'pipeline' }, config)).toBe(false)
     expect(gitlabKind.channel!.allowed!({ ...address(), project: 'other/project' }, config)).toBe(false)
     expect(gitlabKind.channel!.allowed!({ ...address(), iid: '0' }, config)).toBe(false)
+  })
+})
+
+describe('gitlab inline diff notes and discussion resolve', () => {
+  const inline = () => gitlabChannel('merge_request', 1, 'acme/widgets', undefined, undefined,
+    { path: 'src/render.ts', line: 43, side: 'new' })
+  it('opens an inline discussion at the diff note place, with the merge request\'s diff refs as its position', async () => {
+    const h = host()
+    const sent = gitlab(h, {
+      'merge_requests/1': mergeRequest(1, { diff_refs: { base_sha: 'aab075ae', start_sha: 'aab075ae', head_sha: '4ee36fa7' } }),
+      'merge_requests/1/notes': [],
+      'merge_requests/1/discussions': {},
+    })
+    expect(await h.sources.send(message(inline()), h.commands)).toBe('sent')
+    expect(sent.bodies).toEqual([{ body: 'Done\n\n<!-- dsh-superagent:stable-operation -->',
+      position: { position_type: 'text', base_sha: 'aab075ae', start_sha: 'aab075ae', head_sha: '4ee36fa7',
+        old_path: 'src/render.ts', new_path: 'src/render.ts', new_line: 43 } }])
+    expect(h.commands.run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/merge_requests/1/discussions',
+      '--hostname', 'gitlab.example.com', '--method', 'POST', '-H', 'Content-Type: application/json', '--input', expect.stringContaining('.json')])
+    // A retried send finds its marker in the conversation and posts nothing.
+    const retried = gitlab(h, { 'merge_requests/1/notes': [note(1, 'Done\n\n<!-- dsh-superagent:stable-operation -->',
+      { author: { username: 'agent-bot' } })] })
+    expect(await h.sources.send(message(inline()), h.commands)).toBe('sent')
+    expect(retried.bodies).toEqual([])
+  })
+  it('replies in a retained discussion, and keeps a conversation note while GitLab prepares the merge request', async () => {
+    const h = host()
+    gitlab(h, { 'merge_requests/1/discussions/d9': discussion('d9', [diffNote(5, 'Use the token', { author: person('carol') })]),
+      'merge_requests/1/discussions/d9/notes': {}, 'merge_requests/1/notes': [] })
+    const retained = gitlabChannel('merge_request', 1, 'acme/widgets', undefined, 'd9', { path: 'src/render.ts', line: 43 })
+    expect(await h.sources.send(message(retained), h.commands)).toBe('sent')
+    expect(h.commands.run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/merge_requests/1/discussions/d9/notes',
+      '--hostname', 'gitlab.example.com', '--method', 'POST', '-f', expect.stringContaining('Done')])
+    // A merge request GitLab still prepares has no diff_refs: the reply falls back to a conversation note, and nothing throws.
+    const preparing = gitlab(h, { 'merge_requests/1': mergeRequest(1, { diff_refs: null }), 'merge_requests/1/notes': [] })
+    expect(await h.sources.send(message(inline()), h.commands)).toBe('sent')
+    expect(preparing.bodies).toEqual([])
+    expect(h.commands.run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/merge_requests/1/notes',
+      '--hostname', 'gitlab.example.com', '--method', 'POST', '-f', expect.stringContaining('Done')])
+  })
+  it('resolves and reopens a discussion, and names the discussion and its resolution in the read', async () => {
+    const h = host()
+    gitlab(h, { 'merge_requests/1/discussions/d9': discussion('d9', [diffNote(5, 'Use the token', { author: person('carol') })]),
+      'merge_requests/1/discussions': [discussion('d9', [diffNote(5, 'Use the token', { author: person('carol') }),
+        note(6, 'Agreed', { author: person('dave'), created_at: '2026-11-03T02:16:56.000Z' })])] })
+    await resolveGitlabDiscussion(h.commands, 'merge_request', 1, 'd9', true)
+    expect(h.commands.run).toHaveBeenLastCalledWith('/path/agent-glab',
+      ['api', 'projects/acme%2Fwidgets/merge_requests/1/discussions/d9?resolved=true', '--hostname', 'gitlab.example.com', '--method', 'PUT'])
+    await resolveGitlabDiscussion(h.commands, 'merge_request', 1, 'd9', false)
+    expect(h.commands.run).toHaveBeenLastCalledWith('/path/agent-glab',
+      ['api', 'projects/acme%2Fwidgets/merge_requests/1/discussions/d9?resolved=false', '--hostname', 'gitlab.example.com', '--method', 'PUT'])
+    expect(await readGitlab(h.commands, 'gitlab/merge_requests/1/discussions/1')).toMatchObject({ messages: [
+      { id: 'note:5', discussion: 'd9', resolvable: true, resolved: false, path: 'src/render.ts', line: 43 },
+      { id: 'note:6', discussion: 'd9', reply_to: 'note:5' }] })
+  })
+})
+
+describe('gitlab merge request CI', () => {
+  const head = (id: number, status: string) => mergeRequest(9, { author: { username: 'agent-bot' }, source_project_id: 7,
+    source_branch: 'agent/fix-title', state: 'opened', head_pipeline: pipeline(id, status, { ref: 'agent/fix-title' }) })
+  const ticketed = () => {
+    const h = host()
+    h.store.tickets.save({ ...openTicket('t1'), execution: executed('fix-title'), follows: [{ thread: 'gitlab:merge_request:9', own: true }] })
+    h.store.threads.save({ key: 'gitlab:merge_request:9', ref: { source: SOURCE, id: 'merge_request:9' }, createdAt: '',
+      subscriptions: ['t1'], correlated: [], pending: [], meta: {} })
+    return h
+  }
+  it('reports a head pipeline failure and its recovery, and never treats a pending, created or running pipeline as actionable', async () => {
+    const h = ticketed()
+    const routes: Record<string, unknown> = { todos: [], 'merge_requests/9': head(100, 'pending'),
+      'merge_requests/9/pipelines': [pipeline(100, 'pending')],
+      'pipelines/100/jobs': [job(1, 'test', 'pending'), job(2, 'docs', 'failed', { allow_failure: true })] }
+    gitlab(h, routes)
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    expect(h.store.get(KV.gitlab.ci(9))).toEqual({ fingerprint: '100:pending:', failures: [], revision: 0 })
+    // A new pipeline that is only created, then one still running, changes nothing an agent should answer.
+    for (const [id, status] of [[101, 'created'], [102, 'running']] as const) {
+      routes['merge_requests/9'] = head(id, status)
+      routes['merge_requests/9/pipelines'] = [pipeline(id, status)]
+      routes[`pipelines/${id}/jobs`] = [job(1, 'test', status)]
+      await pollRound(h)
+    }
+    expect(h.receive).not.toHaveBeenCalled()
+    expect(h.store.get(KV.gitlab.ci(9))).toEqual({ fingerprint: '102:running:', failures: [], revision: 0 })
+    // Its failure is the first actionable change.
+    routes['merge_requests/9'] = head(103, 'failed')
+    routes['merge_requests/9/pipelines'] = [pipeline(103, 'failed')]
+    routes['pipelines/103/jobs'] = [job(1, 'test', 'failed'), job(2, 'build', 'success')]
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expect.objectContaining({
+      threads: [{ source: SOURCE, id: 'merge_request:9' }], actor: { source: SOURCE, id: '' }, human: false,
+      text: expect.stringContaining('CI failed 1/2 on !9'),
+      meta: { ci: true, kind: 'merge_request', iid: 9, revision: 1, pipelineId: 103, sha: expect.any(String) } })])
+    expect(h.store.threads.get('gitlab:merge_request:9')!.meta.facts).toMatchObject({ ci: { label: { zh: 'CI 失败', en: 'CI failed' },
+      value: '1', problem: true } })
+    // A new pipeline is only pending for now: the reported failure is retained until that pipeline finishes.
+    routes['merge_requests/9'] = head(104, 'pending')
+    routes['merge_requests/9/pipelines'] = [pipeline(104, 'pending')]
+    routes['pipelines/104/jobs'] = [job(1, 'test', 'pending')]
+    await pollRound(h)
+    expect(h.receive).toHaveBeenCalledTimes(1)
+    expect(h.store.get(KV.gitlab.ci(9))).toEqual({ fingerprint: '104:pending:', failures: ['test'], revision: 1 })
+    // Its finished clean run recovers the failure, and the same pipeline read again is no change.
+    routes['merge_requests/9'] = head(105, 'success')
+    routes['merge_requests/9/pipelines'] = [pipeline(105, 'success')]
+    routes['pipelines/105/jobs'] = [job(1, 'test', 'success')]
+    await pollRound(h)
+    expect(h.receive.mock.calls[1]![0]).toMatchObject({ meta: expect.objectContaining({ revision: 2 }),
+      text: expect.stringContaining('CI passed 1/1 on !9') })
+    expect(h.store.get(KV.gitlab.ci(9))).toEqual({ fingerprint: '105:success:', failures: [], revision: 2 })
+    h.receive.mockClear()
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+  })
+  it('keeps a distinct deterministic ID for each reported change', () => {
+    const mr = mergeRequest(9, { author: { username: 'agent-bot' } })
+    const first = mergeRequestCiTrigger(mr, pipeline(103, 'failed'), projectRef(), 1, 'CI failed')
+    expect(mergeRequestCiTrigger(mr, pipeline(103, 'failed'), projectRef(), 1, 'CI failed').id).toBe(first.id)
+    expect(mergeRequestCiTrigger(mr, pipeline(104, 'success'), projectRef(), 2, 'CI passed').id).not.toBe(first.id)
+    expect(first.id).toMatch(/^[0-9a-f]{32}$/)
   })
 })
 
@@ -444,6 +625,36 @@ describe('gitlab polling', () => {
       meta: expect.objectContaining({ kind: 'note', noteId: 5, discussionId: 'd1' }) })])
     expect(h.store.get(KV.gitlab.todos)).toMatchObject({ maxId: 3800 })
     expect(h.store.get(KV.gitlab.cursor('gitlab:issue:3'))).toBeDefined()
+  })
+  it('takes in an Issue body a mention todo points at even when GitLab recorded the todo just after the body', async () => {
+    const h = host()
+    gitlab(h, { todos: [] })
+    await pollRound(h)
+    h.receive.mockClear()
+    // The live case: Issue #4 was created 1.3 s before the `directly_addressed` todo that points at it, and had no notes.
+    const created = '2026-11-03T03:10:59.248Z', todoAt = '2026-11-03T03:11:00.553Z'
+    gitlab(h, {
+      todos: [todo(3791, 'directly_addressed', { created_at: todoAt, project: { id: 7 }, target: { iid: 4, project_id: 7 } })],
+      'issues/4': issue(4, { author: person('carol'), created_at: created, updated_at: created,
+        description: 'Please @agent-bot take a look at the greeting' }),
+      'issues/4/discussions': [],
+    })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expect.objectContaining({
+      threads: [{ source: SOURCE, id: 'issue:4' }], actor: { source: SOURCE, id: 'carol' }, addressed: 'mention', human: true,
+      text: expect.stringContaining('Please @agent-bot take a look'), meta: expect.objectContaining({ kind: 'issue', iid: 4 }) })])
+    expect(h.store.get(KV.gitlab.todos)).toMatchObject({ maxId: 3791 })
+    // An Issue from days before is not read again: its new mention todo brings its new note, not its old body.
+    h.receive.mockClear()
+    gitlab(h, {
+      todos: [todo(3792, 'mentioned', { created_at: '2026-11-03T03:12:00.000Z', project: { id: 7 }, target: { iid: 5, project_id: 7 } })],
+      'issues/5': issue(5, { author: person('carol'), created_at: '2026-10-20T00:00:00.000Z', updated_at: '2026-11-03T03:12:00.000Z',
+        description: 'old @agent-bot mention' }),
+      'issues/5/discussions': [discussion('d', [note(9, 'please look', { author: person('carol'),
+        created_at: '2026-11-03T03:12:00.000Z', updated_at: '2026-11-03T03:12:00.000Z' })])],
+    })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['please look'])
   })
   it('makes the todo itself the Trigger for an assignment or a review request', async () => {
     const h = host()

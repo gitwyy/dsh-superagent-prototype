@@ -153,9 +153,11 @@ export class Commands {
   async gitlabApi<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async gitlabApi(path: string, ...flags: string[]): Promise<string>
   async gitlabApi<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    const [path = '', ...flags] = rest
+    // Without a schema the path is the first argument; with one, the schema is and the path follows it.
+    const raw = typeof schema === 'string'
+    const [path = '', ...flags] = raw ? [schema, ...rest] : rest
     const output = await this.gitlabRun(path, flags)
-    return typeof schema === 'string' ? output : schema.parse(JSON.parse(output))
+    return raw ? output : (schema as z.ZodType<T>).parse(JSON.parse(output))
   }
   /**
    * Fetches every page of a GitLab API list as one flat stream: `--paginate --output ndjson` prints each element on its own

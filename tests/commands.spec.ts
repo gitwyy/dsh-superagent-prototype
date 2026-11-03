@@ -218,6 +218,13 @@ describe('GitLab calls', () => {
     expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/merge_requests/1/discussions',
       '--hostname', 'gitlab.example.com', '--method', 'POST', '-H', 'Content-Type: application/json', '--input', expect.any(String)])
   })
+  it('returns the raw output of a path called without a schema, such as a repository file', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('export const value = 1\n')
+    expect(await value.gitlabApi('repository/files/src%2Fapp.ts/raw?ref=main')).toBe('export const value = 1\n')
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api',
+      'projects/acme%2Fwidgets/repository/files/src%2Fapp.ts/raw?ref=main', '--hostname', 'gitlab.example.com'])
+  })
 })
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {
   const commands = new Commands(() => deployment, {}, new AbortController().signal)

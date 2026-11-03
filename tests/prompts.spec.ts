@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Store } from '../src/app/store.ts'
-import { Prompts, builtInBase, composePrompt, defaultPrompts, policySection, promptParts, type PromptConfig } from '../src/app/prompts.ts'
+import { Prompts, builtInBase, composePrompt, composeSkill, defaultPrompts, policySection, promptParts, type PromptConfig }
+  from '../src/app/prompts.ts'
 import { USER_ERRORS, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { SettingsSchema, policyVersion } from '../src/policy.ts'
@@ -112,7 +113,7 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
   })
 })
 
-it('registers the built-in Source skills, Feishu only with a Feishu bot, before the team skills', () => {
+it('registers the built-in Source skills, Feishu and GitLab only with their Source, before the team skills', () => {
   withStore(store => {
     const config = { ...defaultPrompts(), skills: { release: 'Tag releases.' } }
     const skills = promptsOf(store).skills(config)
@@ -120,6 +121,12 @@ it('registers the built-in Source skills, Feishu only with a Feishu bot, before 
     expect(skills[1]![1]).toContain('## CLI usage')
     expect(skills[2]![1]).toBe('Tag releases.')
     expect(new Prompts(store, () => 100000, variables, () => false).skills(config).map(([name]) => name)).toEqual(['github', 'release'])
+    // A deployment that works through GitLab reads its skill after GitHub's, before the team skills.
+    const gitlab = new Prompts(store, () => 100000, variables, () => false, () => true).skills(config)
+    expect(gitlab.map(([name]) => name)).toEqual(['github', 'gitlab', 'release'])
+    expect(gitlab[1]![1]).toContain('gitlab/repository')
+    expect(gitlab[1]![1]).toContain('## CLI usage')
+    expect(composeSkill(defaultPrompts(), 'gitlab')).toContain('glab')
   })
 })
 
