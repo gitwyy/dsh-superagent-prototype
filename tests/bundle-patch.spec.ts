@@ -28,8 +28,10 @@ const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.confi
 
 it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
   const rows = await patched()
-  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
-    'dsh-superagent-router-preset'])
+  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-gitlab',
+    'dsh-superagent-worker-preset', 'dsh-superagent-router-preset'])
+  // The optional Sources are inserted but off until an operator configures them and turns their rows on.
+  for (const id of ['dsh-superagent-feishu', 'dsh-superagent-gitlab']) expect(rows.find(row => row.id === id)).toMatchObject({ disabled: true })
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)
   const plugins = flat(preset.plugins)
