@@ -656,6 +656,41 @@ describe('gitlab polling', () => {
     await pollRound(h)
     expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['please look'])
   })
+  it('takes in a note a mention todo points at even when GitLab recorded the todo just after the note', async () => {
+    const h = host()
+    gitlab(h, { todos: [] })
+    await pollRound(h)
+    h.receive.mockClear()
+    // The live case: the note at 03:22:00.320 preceded the `directly_addressed` todo at 03:22:00.701 by 381 ms.
+    const todoAt = '2026-11-03T03:22:00.701Z'
+    gitlab(h, {
+      todos: [todo(3792, 'directly_addressed', { created_at: todoAt, project: { id: 7 }, target: { iid: 5, project_id: 7 } })],
+      'issues/5': issue(5, { author: person('carol'), created_at: '2026-11-03T03:21:55.628Z', updated_at: todoAt }),
+      'issues/5/discussions': [discussion('d', [
+        note(8, 'old discussion', { author: person('carol'), created_at: '2026-11-03T00:00:00.000Z', updated_at: '2026-11-03T00:00:00.000Z' }),
+        note(9, '@agent-bot please look', { author: person('carol'), created_at: '2026-11-03T03:22:00.320Z',
+          updated_at: '2026-11-03T03:22:00.320Z' })])],
+    })
+    await pollRound(h)
+    const triggers = h.receive.mock.calls.map(([trigger]) => trigger)
+    // The new Issue's body and the note just before the todo both reach the Source; the hours-old discussion does not.
+    expect(triggers.map(trigger => trigger.meta.kind)).toEqual(['issue', 'note'])
+    expect(triggers[1]).toMatchObject({ addressed: 'mention', text: '@agent-bot please look',
+      meta: expect.objectContaining({ kind: 'note', noteId: 9, discussionId: 'd' }) })
+    expect(h.store.get(KV.gitlab.todos)).toMatchObject({ maxId: 3792 })
+    // An old comment on an old Issue is not re-emitted when a new mention todo arrives; only the new note is.
+    h.receive.mockClear()
+    gitlab(h, {
+      todos: [todo(3793, 'mentioned', { created_at: '2026-11-03T03:25:00.500Z', project: { id: 7 }, target: { iid: 6, project_id: 7 } })],
+      'issues/6': issue(6, { author: person('carol'), created_at: '2026-10-20T00:00:00.000Z', updated_at: '2026-11-03T03:25:00.500Z' }),
+      'issues/6/discussions': [discussion('d2', [
+        note(10, 'old comment', { author: person('carol'), created_at: '2026-11-03T02:00:00.000Z', updated_at: '2026-11-03T02:00:00.000Z' }),
+        note(11, '@agent-bot take a look', { author: person('carol'), created_at: '2026-11-03T03:25:00.100Z',
+          updated_at: '2026-11-03T03:25:00.100Z' })])],
+    })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['@agent-bot take a look'])
+  })
   it('makes the todo itself the Trigger for an assignment or a review request', async () => {
     const h = host()
     gitlab(h, { todos: [todo(3700, 'mentioned', { project: { id: 7 }, target: { iid: 3, project_id: 7 } })] })

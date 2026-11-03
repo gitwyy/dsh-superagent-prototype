@@ -15,11 +15,11 @@ import { mergeRequestsOf, observeMergeRequest, readMergeRequest, type MergeReque
 
 const RETRY_WINDOW_MS = 24 * 3600_000
 /**
- * How far before its todo a mention todo's Issue or merge request body may have been recorded. GitLab creates the todo a
- * moment after the body it mentions (observed about 1.3 s), so a body read driven by the todo accepts one from just before
- * it; the body Trigger's deterministic ID still deduplicates an overlap with the observed streams.
+ * How far before its todo the Issue or merge request body or note a mention todo points at may have been recorded. GitLab
+ * creates the todo just after the message it mentions (observed 0.4–1.3 s), so a read driven by the todo accepts messages
+ * from shortly before it; each Trigger's deterministic ID still deduplicates an overlap with the observed streams.
  */
-const BODY_TOLERANCE_MS = 60_000
+const TODO_TOLERANCE_MS = 60_000
 /** The resolved project the Source watches, with what a poll needs from the account setup verified. */
 interface Project extends GitlabProject { login: string; defaultBranch: string }
 function project(ctx: SourceContext): Project {
@@ -84,10 +84,10 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
 }
 /**
  * Reads the agent's pending todos, which GitLab fills for mentions, assignments and review requests but not for ordinary
- * replies, and reads each todo's Issue or merge request since the todo. A mention todo accepts the body it mentions from
- * shortly before the todo, since GitLab records the notification after the body; the body Trigger keeps a deterministic ID,
- * so a read the observed streams also made is a no-op. The first round records the newest todo as a baseline; todos older
- * than it are never read. Failed reads are retried for a day, and this Source never marks todos done.
+ * replies, and reads each todo's Issue or merge request since the todo. A mention todo accepts the body and notes it
+ * mentions from shortly before the todo, since GitLab records the notification after the message; each Trigger keeps a
+ * deterministic ID, so a read the observed streams also made is a no-op. The first round records the newest todo as a
+ * baseline; todos older than it are never read. Failed reads are retried for a day, and this Source never marks todos done.
  * @returns how many todos the round read.
  */
 async function pollTodos(ctx: SourceContext, round: Round): Promise<number> {
@@ -113,10 +113,10 @@ async function pollTodos(ctx: SourceContext, round: Round): Promise<number> {
     const target = todoTarget(todo, projectInfo, projectInfo.login)
     if (!target) { delete retries[String(todo.id)]; continue }
     try {
-      // Only a mention todo's body may have been recorded before the todo; an assignment or review request keeps its rule.
+      // Only a mention todo's body or note may have been recorded before the todo; an assignment or review request keeps its rule.
       const mention = target.action === 'mentioned' || target.action === 'directly_addressed'
       await intake(ctx, round, { kind: target.kind, iid: target.iid, since: target.since, body: true,
-        ...mention ? { bodyToleranceMs: BODY_TOLERANCE_MS } : {} })
+        ...mention ? { toleranceMs: TODO_TOLERANCE_MS } : {} })
       // An assignment or review request exists only as the notification, so the todo itself carries it.
       if (isTodoRequest(target.action)) await ctx.receive(todoTrigger(todo, target, projectInfo, projectInfo.login))
       delete retries[String(todo.id)]
@@ -311,19 +311,20 @@ function threadRead(ctx: SourceContext, round: Round, kind: GitlabKind, iid: num
   return reading
 }
 /**
- * Reads a conversation and emits the Triggers its new body and notes make, then moves its note cursor. `bodyToleranceMs`
- * lets a todo-driven read accept a body recorded slightly before the todo that points at it.
+ * Reads a conversation and emits the Triggers its new body and notes make, then moves its note cursor. `toleranceMs` lets a
+ * todo-driven read accept the body and notes recorded slightly before the todo that points at them, since GitLab records the
+ * notification after the message it mentions; deterministic Trigger IDs make the overlap with the observed streams a no-op.
  */
 async function intake(ctx: SourceContext, round: Round,
-  input: { kind: GitlabKind; iid: number; since: string; body: boolean; bodyToleranceMs?: number;
+  input: { kind: GitlabKind; iid: number; since: string; body: boolean; toleranceMs?: number;
     object?: GitlabIssue | GitlabMergeRequest }): Promise<void> {
   const read = await threadRead(ctx, round, input.kind, input.iid, input.object)
   const projectInfo = project(ctx)
+  const floor = Date.parse(input.since) - (input.toleranceMs ?? 0)
   if (input.body) {
     const created = Date.parse(read.object.created_at ?? '')
     const user = read.object.author
-    if (Number.isFinite(created) && created >= Date.parse(input.since) - (input.bodyToleranceMs ?? 0)
-      && user && !sameName(user.username, projectInfo.login)) {
+    if (Number.isFinite(created) && created >= floor && user && !sameName(user.username, projectInfo.login)) {
       await ctx.receive(read.kind === 'issue' ? issueTrigger(read.object as GitlabIssue, projectInfo, projectInfo.login)
         : mergeRequestTrigger(read.object as GitlabMergeRequest, projectInfo, projectInfo.login))
     }
@@ -332,7 +333,7 @@ async function intake(ctx: SourceContext, round: Round,
     for (const note of discussion.notes) {
       if (stopped(ctx, round)) throw new Error('The GitLab Source stopped during the poll')
       const timestamp = Date.parse(note.updated_at ?? note.created_at ?? '')
-      if (!Number.isFinite(timestamp) || timestamp < Date.parse(input.since)) continue
+      if (!Number.isFinite(timestamp) || timestamp < floor) continue
       const trigger = noteTrigger(note, { kind: read.kind, iid: read.iid, webUrl: read.webUrl,
         ...discussion.id ? { discussionId: discussion.id } : {} }, projectInfo, projectInfo.login)
       if (trigger) await ctx.receive(trigger)
