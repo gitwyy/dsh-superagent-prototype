@@ -334,16 +334,23 @@ describe('gitlab repository and approval reads', () => {
 
 describe('gitlab channel', () => {
   const address = (overrides: Record<string, string> = {}) => gitlabChannel('issue', 3, 'acme/widgets', undefined, undefined).address
-  it('posts a note with the hidden marker, and finds an earlier post of the same message instead of posting twice', async () => {
+  it('posts a note with the hidden marker, pre-checks only comment notes, and finds an earlier post instead of posting twice', async () => {
     const h = host()
     const routes: Record<string, unknown> = { 'issues/3/notes': [note(1, 'Done\n\n<!-- dsh-superagent:stable-operation -->', { author: { username: 'agent-bot' } })] }
-    gitlab(h, routes)
+    const sent = gitlab(h, routes)
+    // A reply with no retained discussion pre-checks the conversation; GitLab rejects `activity_filter=all` with HTTP 400.
     expect(await h.sources.send(message({ source: SOURCE, thread: 'gitlab:issue:3', address: address() }), h.commands)).toBe('sent')
-    expect(h.commands.run).toHaveBeenCalledTimes(1)
+    expect(sent.calls.map(args => args[1])).toEqual(['projects/acme%2Fwidgets/issues/3/notes?per_page=100&sort=desc&activity_filter=only_comments'])
     routes['issues/3/notes'] = []
     expect(await h.sources.send(message({ source: SOURCE, thread: 'gitlab:issue:3', address: address() }), h.commands)).toBe('sent')
+    // The pre-check lists comments again, then the note is posted without any GET-only query parameter.
+    expect(sent.calls.map(args => args[1])).toEqual([
+      'projects/acme%2Fwidgets/issues/3/notes?per_page=100&sort=desc&activity_filter=only_comments',
+      'projects/acme%2Fwidgets/issues/3/notes?per_page=100&sort=desc&activity_filter=only_comments',
+      'projects/acme%2Fwidgets/issues/3/notes'])
     expect(h.commands.run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/issues/3/notes', '--hostname', 'gitlab.example.com',
       '--method', 'POST', '-f', 'body=Done\n\n<!-- dsh-superagent:stable-operation -->'])
+    expect(sent.calls.flatMap(args => args).join(' ')).not.toContain('activity_filter=all')
   })
   it('replies in a discussion, or in the conversation when GitLab no longer finds it', async () => {
     const h = host()

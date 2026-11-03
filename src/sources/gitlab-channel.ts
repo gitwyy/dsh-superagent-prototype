@@ -59,7 +59,9 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
   const conversation = `${base}/notes`
   const discussionId = message.channel.address.discussionId
   const at = place(message.channel.address)
-  const posted = (): Promise<GitlabNote[]> => commands.gitlabApi(z.array(NoteSchema), `${conversation}?per_page=100&sort=desc&activity_filter=all`)
+  // GitLab's notes list accepts `only_comments`/`only_system` for `activity_filter`, not `all`; the marker is on a comment.
+  const posted = (): Promise<GitlabNote[]> => commands.gitlabApi(z.array(NoteSchema),
+    `${conversation}?per_page=100&sort=desc&activity_filter=only_comments`)
   try {
     // Retained Channel addresses name their discussion; one GitLab no longer finds falls back to the conversation.
     const retained = discussionId
