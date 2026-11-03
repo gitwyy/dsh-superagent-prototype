@@ -1,10 +1,16 @@
 /**
  * GitLab source kind definition and Cordis plugin entry.
- * It is configurable and reports what setup resolved; polling, triggers, replies and merge request binding arrive in the next milestone.
+ * It receives the project's pending todos, the observed issue and merge request streams, the merge requests of open tickets,
+ * subscribed threads and the default branch's CI, and replies in those threads as the agent account.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { GitlabConfigSchema, type GitlabConfig } from '../deployment.ts'
+import { sameName } from '../infra/text.ts'
 import { z } from 'zod'
+import { sendGitlab, gitlabLink } from './gitlab-channel.ts'
+import { runGitlab } from './gitlab-loops.ts'
+import { gitlabThreadContext } from './gitlab-read.ts'
+import { sourceContext } from './host.ts'
 import type { Localized, SourceKind } from './kind.ts'
 
 export const SOURCE = 'gitlab'
@@ -55,6 +61,24 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
     return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
   },
   health: ['gitlab'],
+  channel: {
+    // Replies go to an Issue or merge request of this Source's project, whichever thread a retained address names.
+    allowed: (address, config) => (address.kind === 'issue' || address.kind === 'merge_request') && Number(address.iid) > 0
+      && (!address.project || !config.project || sameName(address.project, config.project)),
+    send: sendGitlab,
+    link: gitlabLink,
+  },
+  threadContext: gitlabThreadContext,
+  // `#12` names Issue 12, `!12` merge request 12, and a page or note URL names what it points at, of this project only.
+  find: query => {
+    const text = query.trim()
+    const named = /^([#!])(\d+)$/.exec(text)
+    const page = /\/-(?:\/)?(issues|merge_requests)\/(\d+)/.exec(text)
+    const kind = named?.[1] === '!' || page?.[1] === 'merge_requests' ? 'merge_request' : 'issue'
+    const iid = named?.[2] ?? page?.[2]
+    const note = /#note_(\d+)/.exec(text)?.[1]
+    return { threads: iid ? [`${SOURCE}:${kind}:${iid}`] : [], terms: note ? [note] : [] }
+  },
   policy: {
     schema: z.object({ allowed: z.array(z.object({ id: z.string().regex(/^[A-Za-z0-9_.-]+$/) }).strict()).default([]),
       bots: z.array(z.object({ id: z.string().regex(/^[A-Za-z0-9_.-]+$/) }).strict()).optional() }).strict(),
@@ -92,7 +116,9 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
     values: ({ deployment, trigger }) => {
       const gitlab = deployment.gitlab
       const iid = trigger?.source === SOURCE ? Number(trigger.meta.iid) || 0 : 0
-      const kind = trigger?.source === SOURCE && (trigger.meta.kind === 'issue' || trigger.meta.kind === 'merge_request') ? trigger.meta.kind : ''
+      // A note names its conversation in `targetKind`; an Issue or merge request Trigger names it in `kind`.
+      const named = trigger?.source === SOURCE ? [trigger.meta.kind, trigger.meta.targetKind] : []
+      const kind = named.find(value => value === 'issue' || value === 'merge_request') ?? ''
       return { DSH_SUPERAGENT_GITLAB_URL: gitlab?.url ?? '', DSH_SUPERAGENT_GITLAB_PROJECT: gitlab?.project ?? '',
         DSH_SUPERAGENT_GITLAB_ACCOUNT: gitlab?.login ?? '', DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: gitlab?.commitEmail ?? '',
         DSH_SUPERAGENT_GITLAB_IID: iid ? String(iid) : '', DSH_SUPERAGENT_GITLAB_KIND: kind,
@@ -112,4 +138,12 @@ export const name = 'dsh-superagent-gitlab'
 export const inject = ['orchestrator']
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.orchestrator.sources.register(gitlabKind), 'gitlab: source kind')
+  ctx.effect(() => {
+    const source = sourceContext(ctx.orchestrator, gitlabKind)
+    const controller = new AbortController()
+    // Unhandled rejections terminate the DSH process, so a failure escaping the polling loop is reported as source health instead.
+    const running = runGitlab(source, controller.signal)
+      .catch((error: unknown) => { source.report('gitlab', { state: 'error', detail: String(error) }) })
+    return async () => { controller.abort(); await running }
+  })
 }

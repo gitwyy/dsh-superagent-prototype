@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
@@ -9,6 +10,7 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { key, type OutboundMessage } from '../src/core/index.ts'
 import { testDeployment } from './fixtures/deployment.ts'
+import { gitlabAccount, gitlabDeployment } from './fixtures/gitlab.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
@@ -158,6 +160,63 @@ describe('GitHub calls', () => {
     expect(tally).toEqual({ skipped: 1 })
     run.mockResolvedValue('{"message":"not a list"}')
     await expect(value.pages(z.looseObject({ id: z.number() }), 'issues/12/comments')).rejects.toThrow()
+  })
+})
+describe('GitLab calls', () => {
+  const commands = () => new Commands(() => gitlabDeployment(), {}, new AbortController().signal)
+  it('name the instance on every call, encode the project path, and refuse paths outside it', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('{"iid":3,"title":"Login fails","extra":true}')
+    expect(await value.gitlabApi(z.looseObject({ iid: z.number() }), 'issues/3')).toEqual({ iid: 3, title: 'Login fails', extra: true })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/issues/3', '--hostname', 'gitlab.example.com'])
+    // Instance-wide endpoints a Source reads are allowed with their query in the path.
+    run.mockResolvedValue('[]')
+    expect(await value.gitlabApi(z.array(z.unknown()), 'todos?state=pending&project_id=7')).toEqual([])
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'todos?state=pending&project_id=7', '--hostname', 'gitlab.example.com'])
+    expect(await value.gitlabApi(z.unknown(), '')).toEqual([])
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets', '--hostname', 'gitlab.example.com'])
+    // A full path of this project is accepted; another project's, another instance's, and a traversal are not.
+    await value.gitlabApi(z.unknown(), 'projects/7/issues/3')
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/7/issues/3', '--hostname', 'gitlab.example.com'])
+    for (const path of ['../other/issues', 'issues/../../x', '/projects/7/issues', 'https://gitlab.com/x', 'projects/8/issues']) {
+      await expect(value.gitlabApi(z.unknown(), path)).rejects.toThrow()
+    }
+    await expect(new Commands(() => testDeployment(), {}, new AbortController().signal).gitlabApi(z.unknown(), 'issues/3'))
+      .rejects.toThrow('The GitLab Source has no working CLI')
+  })
+  it('read every page of a list from the flattened NDJSON stream, and count an item that does not validate', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('{"id":1}\n{"id":2}\n')
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues?per_page=100')).toEqual([{ id: 1 }, { id: 2 }])
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/issues?per_page=100', '--hostname',
+      'gitlab.example.com', '--paginate', '--output', 'ndjson'])
+    run.mockResolvedValue('{"id":1}\n{"id":"two"}\n')
+    const tally = { skipped: 0 }
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues', tally)).toEqual([{ id: 1 }])
+    expect(tally).toEqual({ skipped: 1 })
+    run.mockResolvedValue('{"message":"not a list"}')
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), 'issues')).toEqual([])
+  })
+  it('reports GitLab\'s JSON error message and HTTP status, from a workhorse or an API body', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run')
+    run.mockRejectedValueOnce(commandError({ stderr: 'glab: HTTP 404', stdout: '{"error":"404 Not Found"}', code: 1 }))
+    await expect(value.gitlabApi(z.unknown(), 'issues/3')).rejects.toMatchObject({ message: '404 Not Found (HTTP 404)', code: 404, exitCode: 1 })
+    run.mockRejectedValueOnce(commandError({ stderr: 'glab: 404 Not found (HTTP 404)', stdout: '{"message":"404 Not found"}', code: 1 }))
+    await expect(value.gitlabApi(z.unknown(), 'issues/3')).rejects.toMatchObject({ message: '404 Not found (HTTP 404)', code: 404 })
+  })
+  it('sends JSON bodies through --input with an explicit JSON content type', async () => {
+    const value = commands()
+    let sent: unknown
+    const run = vi.spyOn(value, 'run').mockImplementation(async (_program, args) => {
+      sent = JSON.parse(readFileSync(args[args.indexOf('--input') + 1]!, 'utf8'))
+      return '{"id":"d1"}'
+    })
+    expect(await value.gitlabPost(z.looseObject({ id: z.string() }), 'merge_requests/1/discussions',
+      { body: 'x', position: { position_type: 'text', new_line: 1 } })).toEqual({ id: 'd1' })
+    expect(sent).toEqual({ body: 'x', position: { position_type: 'text', new_line: 1 } })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-glab', ['api', 'projects/acme%2Fwidgets/merge_requests/1/discussions',
+      '--hostname', 'gitlab.example.com', '--method', 'POST', '-H', 'Content-Type: application/json', '--input', expect.any(String)])
   })
 })
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {

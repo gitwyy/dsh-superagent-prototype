@@ -6,6 +6,7 @@ import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
+import type { GitlabRetry } from './sources/gitlab-trigger.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -48,6 +49,16 @@ export const KV = {
     stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
     branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
     ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:') },
+  /**
+   * GitLab Source: the pending-todo cursor (the newest todo id seen, and when polling started) with the reads it retries;
+   * per-Thread note cursor; per-stream cursor and start times by kind; and default-branch CI's failure baseline with the
+   * revision its Trigger IDs count.
+   */
+  gitlab: { todos: record<{ maxId: number; startedAt?: string }>('gitlab-todos'),
+    retries: record<Record<string, GitlabRetry>>('gitlab-retry'),
+    cursor: family<string, [thread: string]>('gitlab-cursor:'),
+    stream: family<{ since: string; started: string }, [stream: string]>('gitlab-stream:'),
+    branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('gitlab-branch-ci') },
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.

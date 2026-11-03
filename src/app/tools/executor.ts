@@ -1,8 +1,10 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { liveTicket, type EngineForExecutor, type ReportState, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
+import type { Vcs } from '../../deployment.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
+import { claimMergeRequest, readMergeRequest } from '../../sources/gitlab-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -17,11 +19,52 @@ export interface ExecutorToolsHost {
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
+  /** GitLab Source context whose merge-request rules govern claiming a reported merge request. */
+  readonly gitlab: SourceContext
   sendReplies(): Promise<void>
+}
+/** The report arguments with the number field of the active VCS: `pr_number` on GitHub, `mr_number` on GitLab. */
+interface ReportArgs {
+  state: ReportState
+  summary: string
+  human_action?: string | null | undefined
+  question_for_trigger_id?: string | undefined
+  pr_number?: number | null | undefined
+  mr_number?: number | null | undefined
+  reply_to_trigger_id?: string | undefined
+}
+/** The number field a report names the Ticket's pull request or merge request by. */
+const numberField = (vcs: Vcs): 'pr_number' | 'mr_number' => vcs === 'gitlab' ? 'mr_number' : 'pr_number'
+/** Builds the report schema with the active VCS's number field alone, so the other VCS's field is refused. */
+function reportSchema(vcs: Vcs, login: string): z.ZodType<ReportArgs> {
+  const number = z.number().int().positive().nullish()
+  const schema = vcs === 'gitlab'
+    ? z.object({
+      state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
+      summary: z.string().min(1),
+      human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
+      question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
+      mr_number: number.describe(`The ticket's merge request: its source merge request, or one by ${login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+      pr_number: number.describe('The same number as mr_number; use mr_number.'),
+      reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+    }).strict()
+    : z.object({
+      state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
+      summary: z.string().min(1),
+      human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
+      question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
+      pr_number: number.describe(`The ticket's PR: its source PR, or one by ${login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+      reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+    }).strict()
+  return schema as z.ZodType<ReportArgs>
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
+  const vcs = host.github.deployment.vcs
+  const field = numberField(vcs)
+  const login = (vcs === 'gitlab' ? host.github.deployment.gitlab?.login : host.github.deployment.github?.login)
+    ?? (vcs === 'gitlab' ? 'the deployment\'s GitLab account' : 'the deployment\'s GitHub account')
   return [
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
@@ -74,21 +117,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     tool({
       name: 'orchestrator_report',
       description: 'Report progress, ready, blocked, failed or dropped, as the work and handoff sections say.',
-      schema: z.object({
-        state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
-        summary: z.string().min(1),
-        human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
-        question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
-        pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github?.login ?? 'the deployment\'s GitHub account'} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
-        reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
-      }).strict(),
+      schema: reportSchema(vcs, login),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
-        const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
-        // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
-        return host.store.atomic(() => {
-          const refused = pull && claimPull(host.github, ticketId, pull)
+        /** Claims the reported number when one is given, records the report, and queues the relay, all in one transaction. */
+        const save = (claim: () => string | undefined) => host.store.atomic(() => {
+          // A rejected claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
+          const refused = claim()
           if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
@@ -99,6 +135,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const notification = relay ? 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
         })
+        // The number names the active VCS's object: a merge request on GitLab, a pull request on GitHub.
+        if (field === 'mr_number') {
+          const number = args.mr_number ?? args.pr_number
+          const mr = number != null ? await readMergeRequest(host.gitlab, number, signal) : undefined
+          return save(() => mr && claimMergeRequest(host.gitlab, ticketId, mr))
+        }
+        const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
+        return save(() => pull && claimPull(host.github, ticketId, pull))
       },
     }),
   ]

@@ -353,7 +353,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
-| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
+| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `gitlabApi`, `gitlabPages` and `gitlabPost`, limited to the configured GitLab instance and project and naming its host on every call, with the flattened NDJSON list stream and GitLab's JSON error message; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub or GitLab HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
@@ -361,14 +361,19 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/kind.ts` | The `SourceKind` protocol |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
-| `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
+| `src/sources/poll.ts` | What GitHub, GitLab and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, `pollFailure`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
 | `src/sources/github-pull.ts` | The pull request rules: which pull requests a Ticket follows (`claimPull`, `observePull`), the closes it reports to the Engine, and `pullEndNotices`, the chat notice of a Ticket that ended merged or closed |
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
-| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: one self-hosted project's Source as configuration, policy rows, health and execution variables; it receives nothing yet, as the polling loops are a later milestone |
+| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: one self-hosted project's Source as configuration, policy rows, health, execution variables, reply channel and Thread context, and the polling loop |
+| `src/sources/gitlab-trigger.ts` | GitLab todos, issue and merge request bodies, notes, discussions and pipelines as Triggers, the thread ids and reply markers, and GitLab addresses |
+| `src/sources/gitlab-pull.ts` | The merge request rules: which merge requests a Ticket follows (`claimMergeRequest`, `observeMergeRequest`), the closes it reports to the Engine, and `mergeRequestEndNotices`, the chat notice of a Ticket that ended merged or closed |
+| `src/sources/gitlab-channel.ts` | The GitLab Channel: notes, discussion replies, `sent` or `gone` |
+| `src/sources/gitlab-read.ts` | The `gitlab/` resources, pipeline snapshots and jobs, and `gitlabThreadContext`: an Issue's or merge request's description and discussions by page |
+| `src/sources/gitlab-loops.ts` | The GitLab polling rounds: pending todos, the observed issue and merge request streams with their comments, default-branch CI, the merge requests of open Tickets, and subscribed Threads |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
@@ -410,7 +415,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/gitlab.spec.ts` | The GitLab Source kind and its policy rows, `resolveGitlab`'s setup checks against the agent glab CLI, and a GitLab deployment's worker shims, git credentials and execution variables |
-| `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
+| `tests/gitlab-source.spec.ts` | The GitLab Source on a `SourceContext`: todo, note, assignment, pipeline and merge request Triggers, thread context and reads, the Channel's posts and gone detection, merge request binding, and the polling rounds with their cursors and health |
+| `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, repository-scoped GitHub calls, and instance- and project-scoped GitLab calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
@@ -447,7 +453,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `gitlab.ts`, recorded GitLab API payloads; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
 
 ## Persistence
 

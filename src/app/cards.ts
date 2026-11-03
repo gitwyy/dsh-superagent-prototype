@@ -1,9 +1,12 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
 import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
-import { pullOf } from '../sources/github-pull.ts'
+import { pullOf as githubPullOf } from '../sources/github-pull.ts'
+import { mergeRequestOf } from '../sources/gitlab-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
 
+/** The pull request or merge request number a Ticket follows, whichever VCS opened it. */
+const pullOf = (ticket: Pick<Ticket, 'follows'>): number | undefined => githubPullOf(ticket) ?? mergeRequestOf(ticket)
 /** Collapses whitespace and truncates text for display previews while keeping code, angle brackets, and links intact for model readers. */
 export function preview(text: string): string { return text.replace(/\s+/g, ' ').slice(0, 160) }
 export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) {
