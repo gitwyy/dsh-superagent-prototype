@@ -3,13 +3,13 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Store } from '../src/app/store.ts'
-import { Prompts, builtInBase, composePrompt, composeSkill, defaultPrompts, policySection, promptParts, type PromptConfig }
+import { Prompts, builtInBase, builtInParts, composePrompt, composeSkill, defaultPrompts, policySection, promptParts, type PromptConfig }
   from '../src/app/prompts.ts'
 import { USER_ERRORS, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import { SettingsSchema, policyVersion } from '../src/policy.ts'
 import { guides, handoffPolicy, mainAdmissionPolicy, masterPrompt, sharedPrompt, workerPrompt } from '../src/app/context.ts'
-import { promptFile } from '../src/app/skill-files.ts'
+import { bundledSkills, promptFile } from '../src/app/skill-files.ts'
 import { packagePath } from '../src/infra/paths.ts'
 import type { Variable } from '../src/app/execution-environment.ts'
 
@@ -96,7 +96,7 @@ it('rejects unknown keys, built-in skill names and oversized configuration befor
     const prompts = promptsOf(store)
     expect(() => prompts.save({ ...defaultPrompts(), shared: 'x' }, 0, 'panel')).toThrow()
     expect(() => prompts.save({ communication: '', scope: '' }, 0, 'panel')).toThrow()
-    for (const name of ['github', 'feishu']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
+    for (const name of ['github', 'gitlab', 'feishu']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
     expect(() => prompts.save({ ...defaultPrompts(), skills: { 'Bad Name': 'x' } }, 0, 'panel')).toThrow()
     expect(() => promptsOf(store, 1000).save(defaultPrompts(), 0, 'panel')).toThrow('exceeds')
     expect(prompts.current().revision).toBe(0)
@@ -110,6 +110,31 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
     expect(promptParts(defaultPrompts(), 'worker', 'env').at(-1)).toEqual({ name: 'runtime/environment', kind: 'generated', key: 'runtime/environment',
       text: 'env' })
     expect(new Prompts(store, () => 100000, () => undefined, () => false).compose(defaultPrompts(), 'worker')).toContain('dsh-superagent is waiting for setup')
+  })
+})
+
+it('bundles the GitLab skill with the same CLI block, and never tells a GitLab worker to use gh', () => {
+  withStore(store => {
+    const config = defaultPrompts()
+    const part = builtInParts()['skill/gitlab']
+    expect(part.roles).toEqual(['orchestrator', 'worker'])
+    expect(part.text).toBe(`${bundledSkills.gitlab.content}\n\n## CLI usage\n${promptFile('cli')}`)
+    const skill = composeSkill(config, 'gitlab')
+    expect(skill).toContain('glab')
+    expect(skill).toContain('--hostname')
+    expect(skill).toContain('never gh')
+    expect(skill).toContain('gitlab/merge_requests')
+    expect(skill).not.toContain('Use gh for')
+    // The CLI block appended to both Source skills names each host's tool instead of one host's.
+    expect(skill).toContain('gh on GitHub, glab on GitLab')
+    expect(composeSkill(config, 'github')).toContain('gh on GitHub, glab on GitLab')
+    // A team may override the GitLab skill text like GitHub's, and the override replaces its whole part.
+    const prompts = new Prompts(store, () => 100000, variables, () => false, () => true)
+    const edited = prompts.validate({ ...config, overrides: { 'skill/gitlab': { text: 'Our GitLab rules.' } } })
+    expect(composeSkill(edited, 'gitlab')).toBe('Our GitLab rules.')
+    expect(prompts.skills(edited)).toContainEqual(['gitlab', 'Our GitLab rules.'])
+    // A deployment that does not work through GitLab does not register it.
+    expect(new Prompts(store, () => 100000, variables, () => false).skills(config).map(([name]) => name)).not.toContain('gitlab')
   })
 })
 

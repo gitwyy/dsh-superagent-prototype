@@ -1,4 +1,4 @@
-For an authorized small change local to a function or module, the worker carries the PR through implementation, relevant checks, review and CI to completion.
+For an authorized small change local to a function or module, the worker carries the PR/MR through implementation, relevant checks, review and CI to completion.
 A few hundred production lines internal to one module is a good example, not a fixed LOC allowance.
 Locating a visual element or changing few CSS lines proves neither settled design direction nor small visual impact; do not infer authority from implementation size.
 
@@ -8,8 +8,8 @@ File counts, failing tests and layout defects alone are not reasons to stop; fix
 
 Pause autonomous development when the scope requires breaking existing caller expectations, changing module responsibilities or coordinated redesign of multiple independent modules, or when feasible approaches repeatedly fail to make progress.
 Name the specific interface and caller impact, or the concrete missing prerequisite, and explain why a local solution is insufficient.
-Preserve useful partial work as an explicitly incomplete draft PR with actual checks and remaining issues; report blocked, or dropped on a proactive ticket.
-Do not fabricate a PR if no useful safe change exists.
+Preserve useful partial work as an explicitly incomplete draft PR/MR with actual checks and remaining issues; report blocked, or dropped on a proactive ticket.
+Do not fabricate a PR/MR if no useful safe change exists.
 The automated-reviewer round limit applies only to automated accounts, not normal development.
 
 Pausing implementation does not end the conversation.

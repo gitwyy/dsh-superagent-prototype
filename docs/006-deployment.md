@@ -5,7 +5,7 @@ Use this guide to install, configure and operate dsh-superagent. It covers accou
 ## What runs
 
 - **A dedicated DeepSeek Harness profile**, called `superagent` in this guide. Create it from the Web profile template. It loads the bundle and serves its panel on `127.0.0.1`. Keep it separate from the profile you work in: the plugin changes process-wide `PATH` and git settings, and its process needs independent restarts and upgrades.
-- **An agent GitHub account.** The agent comments, pushes branches and opens pull requests as this account, through a GitHub CLI signed in only as that account.
+- **An agent account on the deployment's VCS.** A deployment works through GitHub or GitLab, decided by which Source is on. The agent comments, pushes branches and opens pull or merge requests as this account, through a CLI signed in only as that account: `gh` on GitHub, `glab` on GitLab.
 - **Optional:** a Feishu bot for chat requests.
 
 Plugin configuration holds the state directory and machine limits. Use the panel for everything else: Sources for the repository and accounts, Policy for allowed lists, and Execution for worker directories and commands.
@@ -21,8 +21,8 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 ## Prerequisites
 
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
-- GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
-- A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
+- The VCS CLI of the deployment's host: GitHub CLI (`gh`) 2.48 or later for GitHub, or GitLab CLI (`glab`, tested with 1.114.0) for GitLab. Source CLI fields must point to a `gh`, `glab` or `lark-cli` wrapper; the host relies on their subcommands and output formats.
+- One repository or project on github.com or on a self-hosted GitLab (GitHub Enterprise Server is not supported). To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS. A GitLab instance whose API and git remote are served over plain `http` sends its access token unencrypted; prefer `https` where the instance serves it, or SSH for git with the CLI's token for the API.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
@@ -45,6 +45,26 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
+
+### Agent GitLab account
+
+1. Create a GitLab user or service account for the agent and give it at least the Developer role on the project, or Maintainer when it must push to or merge into a protected default branch. A token belongs to that account, so everything the agent writes appears under it. GitLab's `bot: true` flag marks a service account, but nested user references do not carry it.
+2. Give it a GitLab CLI that uses only its own credentials:
+
+   ```sh
+   mkdir -p ~/.local/bin
+   cat > ~/.local/bin/glab-agent <<'EOF'
+   #!/bin/sh
+   GLAB_CONFIG_DIR="$HOME/.config/glab-agent" exec glab "$@"
+   EOF
+   chmod +x ~/.local/bin/glab-agent
+   glab-agent auth login --hostname <gitlab host> --stdin
+   glab-agent api user --hostname <gitlab host>
+   ```
+
+   Sign in as the agent account; `--stdin` reads the access token from standard input, and the last command prints its username. Create a personal, project or group access token with the `api` scope, or `read_api` and `write_repository`, which the git credential helper needs. dsh-superagent reads the username from `auth status` and `api user` the same way. Every call names `--hostname`, because `glab` otherwise targets gitlab.com. The host also reads the account's commit email, which the execution environment names for commits: GitLab publishes no per-user no-reply address.
+
+3. The project's protected default branch decides what the role may do. A Developer can push branches and open merge requests; pushing to or merging into a protected branch needs the level its rule lists, usually Maintainer. Setup records both answers and the delivery instructions follow them; force-pushing a protected branch is never allowed even where GitLab permits it.
 
 ### Feishu bot (optional)
 
@@ -144,8 +164,8 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
-2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
+1. **Sources.** A deployment works through exactly one VCS, so turn on the GitHub Source or the GitLab Source, not both; setup refuses both at once. For GitHub, set the repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For GitLab, set the instance URL (`http://host`, without a path), the project (`namespace/project`, nested namespaces allowed) and the agent CLI wrapper, for example `/home/me/.local/bin/glab-agent`; requests arrive as GitLab todos for mentions, assignments and review requests, and the receive-all switches bring new issues, merge requests, comments and default-branch CI under the Policy's admission table. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages.
+2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the accounts who may ask for work — GitHub logins, GitLab usernames, or Feishu users — and, for GitLab, the bot accounts whose comments may become inferred candidates; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
 3. **Execution.** The directory root and a prepare command. To give each Ticket a checkout of the repository:
 
    ```sh
@@ -153,8 +173,15 @@ Setup must succeed before polling or work starts. Overview lists missing require
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
    ```
 
+   A GitLab deployment uses the same shape with its own variables: the project is fetched from `$DSH_SUPERAGENT_GITLAB_URL/$DSH_SUPERAGENT_GITLAB_PROJECT.git`, and a merge request that started the Ticket points `${DSH_SUPERAGENT_GITLAB_MR_HEAD}` at its head:
+
+   ```sh
+   git -C /home/me/src/widgets fetch --no-tags "$DSH_SUPERAGENT_GITLAB_URL/$DSH_SUPERAGENT_GITLAB_PROJECT.git" "${DSH_SUPERAGENT_GITLAB_MR_HEAD:-HEAD}:refs/dsh-superagent/$DSH_SUPERAGENT_TICKET" &&
+   git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
+   ```
+
    List personal CLIs, such as one signed in to your own account, as blocked commands.
-4. **Prompts.** Set the team sections: the GitHub disclosure line, review bots, the commit author and the auto-merge condition.
+4. **Prompts.** Set the team sections: the disclosure line that every message on the active VCS begins with, review bots, the commit author and the auto-merge condition, whose commands are `gh` on GitHub or `glab --hostname` on GitLab.
 
 ### Management API
 
@@ -187,7 +214,7 @@ Health entries are grouped by responsibility:
 | `evals` | Unavailable Evals from the last hour with no later judgement or dismissal |
 | `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
-| `github`, `feishu`, `history` | Source polling, events and history recovery |
+| `github`, `gitlab`, `feishu`, `history` | Source polling, events and history recovery |
 | `sync:<source id>` | Allowed-list synchronization |
 
 A refusal has a status and `error`, its English text:
@@ -199,8 +226,8 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
-- `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
+- `source:github`, `source:gitlab`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; GitLab's has `url`, `project` and `cli`, the same four switches named `observeIssues`, `observeMergeRequests`, `observeComments` and `observeCi`, and the advanced `pollSeconds` and `failuresBeforeError`; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`. At most one VCS Source may be enabled; setup refuses a GitHub and a GitLab Source both on.
+- `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "gitlab": {"allowed": [{"id": "<username>"}], "bots": [{"id": "project_480_bot_…"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, `issues`, `pulls`, `comments` or `ci` for GitHub, and `issues`, `merge_requests`, `comments` or `ci` for GitLab; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
 
@@ -217,18 +244,18 @@ curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json
 
 Setup uses the DeepSeek Harness subprocess service, as worker shells do. It removes environment variables whose names contain KEY, PASSWORD, SECRET or TOKEN.
 
-Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source.
+Setup verifies the configured VCS and writes the worker environment. For GitHub it verifies the repository and the agent's push access, and checks that git uses only the agent credentials for github.com. For GitLab it runs `glab auth status` and `api user --hostname` against the configured instance, reads the project and its canonical path, reads the protected default branch, and checks that git reads the GitLab credential configuration (`gitlabGitTooOld`). Setup refuses a role below Developer, records whether that role may push and merge on the protected branch, and rejects a project or branch list the CLI cannot report (`gitlabCliSignedOut`, `gitlabProjectUnreadable`, `gitlabReadOnly`, `gitlabBranchesUnreadable`). A Feishu setup failure disables only the Feishu Source.
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
-- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's GitHub CLI, `glab` runs the GitLab CLI with `GITLAB_HOST` naming the instance, `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target. A shim for a VCS this deployment does not use answers with the reason it is unavailable.
+- **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. On GitHub it selects the agent CLI as the github.com credential helper and rewrites GitHub SSH addresses to HTTPS; on GitLab it selects the agent CLI as `glab auth git-credential` for the instance's host and rewrites that host's SSH addresses to its URL scheme. It defines the Git LFS filters for both. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN` and `CI_JOB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
 ## Try it
 
-From an allowed GitHub account, open an Issue or post a comment containing `@<agent login> <request>`. Within a polling interval (one minute by default), Overview should show a Ticket. The agent acknowledges the request, works in its own Session and directory, and delivers in the original conversation. For Feishu, mention the bot in a configured chat.
+On GitHub, from an allowed account, open an Issue or post a comment containing `@<agent login> <request>`. On GitLab, mention `@<agent username>` in a project issue or merge request note. Within a polling interval (one minute by default), Overview should show a Ticket. The agent acknowledges the request, works in its own Session and directory, and delivers in the original conversation: a pull request on GitHub, a merge request from its `agent/<ticket>` branch on GitLab. For Feishu, mention the bot in a configured chat.
 
 ## Upgrade
 
@@ -256,6 +283,12 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
+| `The agent GitLab CLI is not set.` | Set the agent's CLI on the GitLab card |
+| `The agent GitLab CLI was not found.` | Set the wrapper's absolute path, or a command name on `PATH` |
+| `The agent GitLab CLI is not signed in to …` | Sign the wrapper in with `glab auth login --hostname <host>` |
+| `The GitLab Source names no host URL.` or `… names no project.` | Set the instance URL and the project, `namespace/project`, on the GitLab card |
+| `The GitHub Source and the GitLab Source are both on; turn one off.` | Turn one of them off; a deployment works through one VCS |
+| `git does not read the GitLab credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |
 | `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
@@ -271,4 +304,4 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `dsh-superagent configuration has keys it does not use` (log) | Remove the named keys; the message says where each value lives now |
 | The log says the plugin is incompatible with the running dsh | Install a DeepSeek Harness version within the `engines.dsh` range |
 | The panel shows "Failed to load plugins" after a DeepSeek Harness upgrade | Restart the running instance |
-| Nothing happens after a mention | Check that the author is on the Source's allowed list, the Source is on, and processing is not paused. On GitHub, a mention added by editing an Issue's body is not received; mention the agent in a comment |
+| Nothing happens after a mention | Check that the author is on the Source's allowed list, the Source is on, and processing is not paused. On GitHub, a mention added by editing an Issue's body is not received; mention the agent in a comment. On GitLab, a mention arrives as a todo, and editing an issue or merge request description creates no new one; post a new note |

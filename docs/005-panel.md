@@ -29,11 +29,11 @@ A dropped message links to its Ticket, or to its Thread when it has no Ticket. T
 
 A human follow-up still owned by an Executor is marked **Delivered to Ticket**, without an Eval. The Thread also shows hand-back reasons and context-only Subscriptions. **Evaluate again** can send that follow-up to Eval, or retry a Trigger with no effective judgement: one filtered by its Source, an unavailable Eval, or a delivered message with neither a non-stop Decision nor an Executor acknowledgement.
 
-Ticket details show the originating Trigger, Decision and reason, scope and Policy version. Assignments and secondary details are folded below the immediate actions. **Retry** is available for failed Input delivery or a Ticket waiting for a person after a blocked or failed Report. Ended Tickets show outcomes such as **Pull request merged** or **Stopped by a person**.
+Ticket details show the originating Trigger, Decision and reason, scope and Policy version. Assignments and secondary details are folded below the immediate actions. **Retry** is available for failed Input delivery or a Ticket waiting for a person after a blocked or failed Report. Ended Tickets show outcomes such as **Pull or merge request merged** or **Stopped by a person**.
 
 ## Settings groups
 
-- **Sources:** one card per Source with its switch, fields and verified account facts. GitHub also offers receive-all switches for new Issues, pull requests, comments and default-branch CI. Polling and read limits are under Advanced.
+- **Sources:** one card per Source with its switch, fields and verified account facts. The active VCS is GitHub or GitLab, and only one of their Sources may be on. GitHub also offers receive-all switches for new Issues, pull requests, comments and default-branch CI; GitLab offers its instance URL, project, agent CLI and receive-all switches for new issues, merge requests, comments and default-branch CI, with the protected branch's push and merge permission among its facts. Polling and read limits are under Advanced.
 - **Eval:** the Policy version and rules, followed by **On each Source** and the Eval settings. Each Source tab contains its allowed list, membership sync, admission table and bot list. Sync runs at startup and on **Sync now**. The admission table distinguishes receiving scope, sender membership and whether the message addresses the agent. Eval settings select the accept mode, timeout and assessment model.
 - **Execution:** worker model, concurrency, directory root, prepare command and blocked commands. Clicking an available variable inserts it into the prepare command.
 - **Prompts:** **Edit** changes team sections, built-in parts and skills. **Full prompt** shows the assembled text and compares it with saved text or defaults. **History** lists versions. Edited built-in parts are marked changed and can be reset; templates list their required placeholders.
@@ -43,9 +43,9 @@ Ticket details show the originating Trigger, Decision and reason, scope and Poli
 
 ## Search
 
-The header search finds Triggers by text, id, Feishu message id or a stored link, such as a GitHub comment URL. A Feishu link missing from the original message becomes searchable only after the host reads it during the current process lifetime.
+The header search finds Triggers by text, id, Feishu message id or a stored link, such as a GitHub comment or GitLab note URL. A Feishu link missing from the original message becomes searchable only after the host reads it during the current process lifetime.
 
-Search also finds Threads by references such as `#12` or a GitHub URL, and Tickets by title or a matching Thread.
+Search also finds Threads by references such as `#12`, `!12` or a GitHub or GitLab URL, and Tickets by title or a matching Thread.
 
 ## Principles
 

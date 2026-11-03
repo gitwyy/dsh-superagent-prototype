@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
 import type { EffectKind } from '../src/app/effects.ts'
+import { SETUP_PROBLEMS } from '../src/setup.ts'
 import { en, zh, type DshSuperagentKey } from '../src/client/locales.ts'
 import { reasonLabel, type T } from '../src/client/text.ts'
 import { REASONS, USER_ERRORS } from '../src/core/index.ts'
@@ -39,6 +40,25 @@ it('words every refusal the host words by code, in both languages', () => {
 
 it('has words for every reason code the core records', () => {
   expect(Object.keys(REASONS).filter(code => code !== 'said' && !(`reason.${code}` in zh))).toEqual([])
+})
+
+it('words every setup problem by code, including the GitLab Source and the one-active-VCS refusal', () => {
+  const codes = Object.keys(SETUP_PROBLEMS)
+  expect(codes.filter(code => !zh[`setup.${code}` as DshSuperagentKey] || !en[`setup.${code}` as DshSuperagentKey])).toEqual([])
+  // The GitLab Source's problems name their own card or the CLI, and the both-on refusal names both VCS Sources.
+  for (const code of ['gitlabUrlUnset', 'gitlabProjectUnset', 'gitlabCliUnset', 'gitlabCliMissing', 'gitlabCliSignedOut', 'gitlabNoAccount']) {
+    expect(zh[`setup.${code}` as DshSuperagentKey]).toContain('GitLab')
+  }
+  // The ones that name a project keep the values the setup error fills in.
+  for (const code of ['gitlabProjectUnreadable', 'gitlabProjectUnreported', 'gitlabReadOnly']) {
+    expect(zh[`setup.${code}` as DshSuperagentKey]).toMatch(/\{(account|project)\}/)
+  }
+  expect(zh['setup.bothVcsSources']).toContain('GitHub')
+  expect(zh['setup.bothVcsSources']).toContain('GitLab')
+  // The labels a GitLab deployment shows: its Source, health, skill part, fix hint, VCS row and project row.
+  for (const key of ['source.gitlab', 'health.gitlab', 'promptPart.skill/gitlab', 'problemSetupFix.gitlab', 'deploymentVcs', 'deploymentProject'])
+    expect(zh[key as DshSuperagentKey], key).toBeTruthy()
+  expect(zh.deploymentProject).toBe('项目')
 })
 
 it('words the reasons agents read in the glossary\'s words: a sender on the list, a Thread', () => {

@@ -83,6 +83,13 @@ it('renders the Deployment page with the derived accounts in the Plugin Manager,
   server.form = fakeForm().form
   await render('page')
   for (const fact of ['acme/widgets', '@agent-bot', 'Widgets Bot', '账号在 dsh-superagent 面板的来源设置里修改。']) expect(text()).toContain(fact)
+  expect(text()).toContain(zh.deploymentRepository)
+  // A deployment that works through GitLab names its project and version control instead.
+  server.setup = { ...server.setup, accounts: { ...server.setup.accounts!, vcs: 'gitlab', repository: 'group/project' } }
+  await render('page')
+  expect(text()).toContain(zh.deploymentProject)
+  expect(text()).toContain(zh['source.gitlab'])
+  expect(text()).toContain('group/project')
   server.setup = { ...server.setup, problem: problemOf('repositoryUnset'), accounts: null }
   await render('page')
   expect(text()).toContain('部署检查未通过：GitHub 来源没有设置监听的仓库。')

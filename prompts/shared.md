@@ -5,3 +5,5 @@ Workers own implementation investigation, technical choices and verification.
 Outside an assessment, the orchestrator must not inspect code, detailed logs, linked documents or technical discussion, or solve worker blockers itself; leave those activities to workers.
 Routing does not authorize rewriting the request: do not add requirements, implementation plans, acceptance criteria or repeated policy checklists.
 Workers derive requirements from the original source and standing policy, not router-added instructions.
+
+One deployment works through GitHub or GitLab: PR/MR means its pull request or merge request; gh and glab are its CLIs; the environment names its account and commit identity.

@@ -1131,13 +1131,17 @@ it('runs a GitHub-only deployment: the GitHub part of the Policy decides alone, 
 })
 
 
-it('credits each human reviewer once in the default delivery requirements on every commit of the PR, never with an empty commit', async () => {
+it('credits each human reviewer once in the default delivery requirements on every commit of the PR/MR, never with an empty commit', async () => {
   const delivery = runtime.prompts.current().config.delivery
-  expect(delivery).toContain('Co-authored-by: <name or login> <id+login@users.noreply.github.com>')
-  expect(delivery).toContain('on every commit of the PR branch')
+  expect(delivery).toContain('Co-authored-by: <name or login> <email>')
+  expect(delivery).toContain('<id>+<login>@users.noreply.github.com')
+  expect(delivery).toContain('on every commit of the PR/MR branch')
   expect(delivery).toContain('git filter-branch -f --msg-filter')
   expect(delivery).toContain('Never push an empty commit to credit a reviewer.')
   expect(delivery).toContain('Do not credit bots')
+  // A GitLab reviewer is looked up with glab, and no address is invented for one whose email is private.
+  expect(delivery).toContain('glab api "users?username=<username>" --hostname <host>')
+  expect(delivery).toContain('orchestrator_report when it is not public')
 })
 
 it('shows a failed reply as a problem with its attempts, an error of the reply effects after three, until it is withdrawn', async () => {
