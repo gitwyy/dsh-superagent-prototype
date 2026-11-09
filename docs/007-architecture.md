@@ -422,6 +422,7 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/nightshift-runner.spec.ts` | Fake Pi RPC lifecycle and scoped guard execution in disposable repositories |
 | `tests/nightshift-actions.spec.ts` | Separately approved validation recipes, source-bound receipts, scoped local commit and fail-closed publication |
 | `tests/nightshift-adapter.spec.ts` | DM-only authentication, parser/config boundaries, pause and message idempotency |
+| `tests/nightshift-e2e.spec.ts` | Isolated normalized-message to real controller/SQLite to supervised fake-Pi integration, serial runs, persistent replies and handoff exit proof |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
