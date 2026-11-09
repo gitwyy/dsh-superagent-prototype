@@ -162,6 +162,16 @@ describe('explicit scoped action broker', { timeout: 30_000 }, () => {
     expect(commit.options.env).toMatchObject({ GIT_AUTHOR_NAME: 'Approved Author', GIT_COMMITTER_EMAIL: 'approved@invalid' })
     expect(commit.args).toContain('core.hooksPath=/dev/null'); expect(commit.args).toContain('--no-gpg-sign')
   })
+  it('executes a real scoped local commit only in a disposable test repository', async () => {
+    const f = fixture(); const broker = createActions(f.policy, f.guard)
+    writeFileSync(resolve(f.repo, 'source.txt'), 'verified local commit\n')
+    expect((await broker.execute({ action: 'validate', repository: 'app', recipe: 'check' })).passed).toBe(true)
+    const out = await broker.execute({ action: 'commit', repository: 'app', message: 'test: approved disposable fixture change' })
+    expect(out.outcome).toBe('succeeded')
+    expect(f.git(['status', '--porcelain'])).toBe('')
+    expect(f.git(['log', '-1', '--format=%an <%ae>'])).toContain('Approved Author <approved@invalid>')
+    expect(f.git(['show', '--format=', '--name-only', 'HEAD']).trim()).toBe('source.txt')
+  })
   it('never retries an uncertain commit result or resets the staged index', async () => {
     const f = fixture(); let commitAttempts = 0
     const broker = createActions(f.policy, f.guard, { spawnProcess(executable: string, args: string[], options: SpawnOptions) {

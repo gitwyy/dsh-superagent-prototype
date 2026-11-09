@@ -104,6 +104,19 @@ it('records the service PID at start, and still refuses a second instance the sc
   expect(again).toMatchObject({ code: 1, stderr: expect.stringContaining('Multiple dsh-superagent processes') })
   expect(await status('superagent')).toMatchObject({ pids: [pid, second] })
 }, 20_000)
+it('remembers explicit launch overlays and refuses missing saved overlays instead of changing modes', async () => {
+  const url = await answering(), pid = sleeper(), patch = join(root, 'night mode.yml')
+  writeFileSync(patch, '[]\n'); writeFileSync(join(root, 'pane'), `${pid}\n`); started(service(pid))
+  expect(await run('start', '--url', url, '--patch', patch)).toMatchObject({ code: 0 })
+  const saved = join(control('superagent'), 'launch-patches.json')
+  expect(JSON.parse(readFileSync(saved, 'utf8'))).toEqual([realpathSync(patch)])
+  expect(readFileSync(join(root, 'tmux.log'), 'utf8')).toContain('--patch')
+  expect(await run('start', '--url', url)).toMatchObject({ code: 0 })
+  expect(JSON.parse(readFileSync(saved, 'utf8'))).toEqual([realpathSync(patch)])
+  writeFileSync(saved, JSON.stringify([join(root, 'does-not-exist.yml')]))
+  expect(await run('restart', '--url', url)).toMatchObject({ code: 1, stderr: expect.stringContaining('refusing a default-mode fallback') })
+  expect(() => process.kill(pid, 0)).not.toThrow()
+}, 20_000)
 it('waits only for the process it stopped', async () => {
   const pid = sleeper()
   // Another instance shows up once the stopped one ended.

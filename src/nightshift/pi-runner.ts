@@ -240,7 +240,8 @@ export class PiRunner implements Runner {
       const prompt = () => {
         if (!ready || !stateVerified || prompted || stopping || done) return
         prompted = true
-        const body = `Nightshift task ${task.id}\nRepository scope: ${task.repositories.join(', ')}\nAccess: ${task.access}; scoped write approval: ${task.approved === true ? 'yes' : 'no'}\n\n${task.text}`
+        const recipes = Object.fromEntries(task.repositories.map(name => [name, Object.keys(config.repositoryActions?.[name]?.validations ?? {})]))
+        const body = `Nightshift task ${task.id}\nRepository scope: ${task.repositories.join(', ')}\nAccess: ${task.access}; scoped write approval: ${task.approved === true ? 'yes' : 'no'}\nSeparately approved actions: ${task.actions?.join(', ') || 'none'}\nAvailable fixed validation recipes by repository: ${JSON.stringify(recipes)}\n\n${task.text}`
         if (Buffer.byteLength(body) > 128 * 1024) { stop('blocked', 'Task prompt exceeds limit'); return }
         send({ id: `${runId}:prompt`, type: 'prompt', message: body })
       }

@@ -88,6 +88,7 @@ process.stdin.on('data', chunk => {
      emit({ id: record.id, type:'response', command:'prompt', success:true, data:{ disposition: mode === 'handled' ? 'handled' : 'started' } });
      if (mode === 'ui') { emit({type:'extension_ui_request', id:'dialog', method:'confirm'}); continue; }
      if (mode === 'blocked') { emit({type:'extension_ui_request', method:'setStatus', statusKey:'nightshift-guard', statusText:policy.runId + ':blocked'}); continue; }
+     if (mode === 'uncertain-action') { emit({type:'extension_ui_request', method:'setStatus', statusKey:'nightshift-guard', statusText:policy.runId + ':unknown'}); continue; }
      if (mode === 'extension-error') { emit({type:'extension_error'}); continue; }
      if (mode === 'unknown-tool') { emit({type:'tool_execution_end', toolName:'mcp__bypass', isError:true}); continue; }
      if (mode === 'malformed') { process.stdout.write('NOT JSON\\n'); continue; }
@@ -144,6 +145,10 @@ describe('supervised fake Pi (never actual Pi)', { timeout: 40_000 }, () => {
     const f = fixture(mode); const out = await f.runner.run(f.request, new AbortController().signal)
     expect(out.outcome).toBe('blocked'); expect(out.writerStopped).toBe(true)
     if (mode === 'ui') expect(JSON.parse(readFileSync(f.config.sessionFile + '.ui', 'utf8'))).toMatchObject({ cancelled: true, confirmed: false })
+  })
+  it('keeps unknown mutation outcome even after the Pi writer exits cleanly', async () => {
+    const f = fixture('uncertain-action'); const out = await f.runner.run(f.request, new AbortController().signal)
+    expect(out.outcome).toBe('unknown'); expect(out.writerStopped).toBe(true)
   })
   it.each(['malformed', 'parent-exit', 'nonzero'])('does not report success on %s', async mode => {
     const f = fixture(mode); const out = await f.runner.run(f.request, new AbortController().signal)

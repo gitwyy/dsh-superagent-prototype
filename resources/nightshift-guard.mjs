@@ -271,7 +271,7 @@ export default function nightshiftGuard(pi) {
               const result = await actions.execute(input, signal)
               if (result.outcome === 'unknown') { ready = false; ctx.ui.setStatus('nightshift-guard', `${policy.runId}:unknown`) }
               else if (result.outcome === 'blocked') blocked(ctx)
-              return { ...textResult(JSON.stringify(result)), isError: result.outcome !== 'succeeded' }
+              return { ...textResult(JSON.stringify(result)), isError: result.outcome === 'blocked' || result.outcome === 'unknown' }
             }
             return await guard.execute(name, input, signal)
           } catch (error) {

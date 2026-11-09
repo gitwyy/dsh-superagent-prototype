@@ -214,7 +214,8 @@ def main():
                         help='DSH profile that loads dsh-superagent; its tmux session is dsh-<profile>.')
     parser.add_argument('--url', default=os.environ.get('DSH_SUPERAGENT_URL') or 'http://127.0.0.1:3082',
                         help='Health-check URL; override after changing the profile port.')
-    parser.add_argument('--patch', action='append', default=[], help='Explicit extra DSH patch file for start/restart; always pass it again on restart.')
+    parser.add_argument('--patch', action='append', default=[], help='Extra DSH patch file; remembers the list after a successful start.')
+    parser.add_argument('--clear-patches', action='store_true', help='Explicitly discard saved launch overlays (for reviewed rollback only).')
     parser.add_argument('--timeout', type=float, default=60, help='Startup timeout in seconds.')
     parser.add_argument('--stop-timeout', type=float, default=300,
                         help='Graceful shutdown timeout in seconds; running Executor Sessions finish their step first.')
@@ -231,6 +232,18 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('Another dsh-superagent control operation is in progress.') from None
+        launch_config = control(args.profile) / 'launch-patches.json'
+        if args.clear_patches and args.patch:
+            parser.error('--clear-patches cannot be combined with --patch')
+        if args.action in ('start', 'restart'):
+            if not args.clear_patches and not args.patch and launch_config.exists():
+                saved = json.loads(launch_config.read_text())
+                if not isinstance(saved, list) or not all(isinstance(item, str) and Path(item).is_absolute() for item in saved):
+                    raise RuntimeError('Saved patch list is invalid; refusing a default-mode fallback.')
+                args.patch = saved
+            for patch in args.patch:
+                if not Path(patch).is_file():
+                    raise RuntimeError('Launch overlay is missing; refusing a default-mode fallback: ' + patch)
         if args.respect_stop and args.action in ('start', 'restart') and stopped(args.profile):
             print('Intentional stop is active; automatic recovery skipped.')
             return 0
@@ -240,7 +253,10 @@ def main():
             # Only a stop keeps automatic recovery off; a restart whose stop timed out leaves it on.
             stop(args, intentional=args.action == 'stop')
         if args.action in ('start', 'restart'):
-            return start(args)
+            code = start(args)
+            if code == 0:
+                launch_config.write_text(json.dumps([str(Path(item).resolve()) for item in args.patch]) + '\n')
+            return code
     return 0
 
 
