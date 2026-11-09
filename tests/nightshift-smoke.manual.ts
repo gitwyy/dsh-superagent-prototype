@@ -28,9 +28,13 @@ console.log(JSON.stringify({ root, preflight }))
 if (!preflight.ok) process.exitCode = 1
 else {
   const result = await runner.run({ runId: 'live-read-only-smoke', task, config, deadline: new Date(Date.now() + 90000).toISOString() }, new AbortController().signal)
+  const continuation = result.outcome === 'succeeded' ? await runner.run({ runId: 'live-read-only-continuation',
+    task: { ...task, id: 'smoke-continuation', text: 'Without tools or filesystem reads, reply exactly with the fixture line you read in the previous task in this session.' },
+    config, deadline: new Date(Date.now() + 90000).toISOString() }, new AbortController().signal) : undefined
   const status = execFileSync('/usr/bin/git', ['-C', workspace, 'status', '--porcelain'], { encoding: 'utf8' })
-  const evidence = { at: new Date().toISOString(), root, result, worktreeClean: status === '' }
+  const evidence = { at: new Date().toISOString(), root, result, continuation, worktreeClean: status === '' }
   await writeFile(join(root, 'evidence.json'), JSON.stringify(evidence, null, 2))
   console.log(JSON.stringify(evidence))
-  if (result.outcome !== 'succeeded' || !result.writerStopped || status !== '') process.exitCode = 1
+  if (result.outcome !== 'succeeded' || !result.writerStopped || continuation?.outcome !== 'succeeded'
+    || !continuation.writerStopped || !continuation.summary.includes('nightshift-read-only-fixture') || status !== '') process.exitCode = 1
 }
