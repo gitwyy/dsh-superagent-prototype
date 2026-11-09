@@ -417,6 +417,7 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 
 | Test | Covers |
 | --- | --- |
+| `tests/drive-exclusion.spec.ts` | Cross-entry exclusion of enrolled nightshift workspaces, symlink aliases and malformed registry failure |
 | `tests/nightshift-controller.spec.ts` | Durable task authorization, serial dispatch, cancellation races, locks and restart ambiguity |
 | `tests/nightshift-runner.spec.ts` | Fake Pi RPC lifecycle and scoped guard execution in disposable repositories |
 | `tests/nightshift-actions.spec.ts` | Separately approved validation recipes, source-bound receipts, scoped local commit and fail-closed publication |

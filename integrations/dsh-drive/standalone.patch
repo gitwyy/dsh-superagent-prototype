@@ -1,0 +1,55 @@
+--- a/dsh-drive/src/driver.mjs
++++ b/dsh-drive/src/driver.mjs
+@@ -12,6 +12,7 @@
+ import fs from 'node:fs';
+ import path from 'node:path';
+ import { createDecider, pickOption } from './permissions.mjs';
++import { assertDriveWorkspaceAllowed } from './protected-workspaces.mjs';
+ 
+ export const NUDGE_PROMPT = [
+   '[驾驶台自动补发] 你先前派出的异步子代理已全部结束（产物已静默）。',
+@@ -114,6 +115,7 @@
+   } = o || {};
+   if (!prompt) throw new Error('runDrive: 缺少 prompt');
+   if (!workspace) throw new Error('runDrive: 缺少 workspace');
++  assertDriveWorkspaceAllowed(path.resolve(workspace));
+ 
+   const log = o.log || ((s) => console.log(s));
+   const logError = o.logError || ((s) => console.error(s));
+--- a/dsh-drive/bin/dsh-drive.mjs
++++ b/dsh-drive/bin/dsh-drive.mjs
+@@ -20,6 +20,7 @@
+ import { buildPiEnv } from '../src/env.mjs';
+ import { initPiHome, DEFAULT_COMPACTION, contextWindows, compactionOverrides } from '../src/home.mjs';
+ import { runDrive, killCurrentPi } from '../src/driver.mjs';
++import { assertDriveWorkspaceAllowed } from '../src/protected-workspaces.mjs';
+ import { readSessionWaterLevel, resolveSession, listSessions, fmtTokens } from '../src/session.mjs';
+ import { updateLatestLink } from '../src/logs.mjs';
+ import { watch, watchBox } from '../src/watch.mjs';
+@@ -204,6 +205,8 @@
+         console.error(`业务线不存在: ${line}（可选: ${listLines(cfg).join(' ') || '(无)'}）`);
+         return 2;
+       }
++      assertDriveWorkspaceAllowed(path.resolve(r.workspace));
++      assertDriveWorkspaceAllowed(path.resolve(process.env.PI_DRIVE_WORKSPACE || r.workspace));
+       const env = buildPiEnv({ cfg, line });
+       // 日志名：缺省带时间戳；调用方（插件）可用 --log-file 指定成 `<线>-<turnId>.log`，便于按 turnId 对上号
+       // ⚠️ `--log-file` 无值时 flag() 返回 true（布尔），别在 cwd 生成名为 "true" 的文件
+--- a/pi_drive.mjs
++++ b/pi_drive.mjs
+@@ -22,6 +22,7 @@
+ import fs from 'node:fs';
+ import path from 'node:path';
+ import process from 'node:process';
++import { assertDriveWorkspaceAllowed } from './dsh-drive/src/protected-workspaces.mjs';
+ 
+ const WORKSPACE = process.env.PI_DRIVE_WORKSPACE || process.cwd();
+ const SESSION = process.env.PI_DRIVE_SESSION || 'dsh-drive';
+@@ -30,6 +31,7 @@
+ const TIMEOUT_S = Number(process.env.PI_DRIVE_TIMEOUT || 1800);
+ 
+ if (!PROMPT) { console.error('用法: node pi_drive.mjs "任务提示词"'); process.exit(2); }
++assertDriveWorkspaceAllowed(path.resolve(WORKSPACE));
+ 
+ // ── 永不自动放行（转人工）─────────────────────────────────────
+ const ESCALATE = [
