@@ -6,6 +6,7 @@ export const NIGHT_HELP = [
   '任务格式：入队 只读 mate-workspace | 任务说明',
   '写任务格式：入队 修改 mate-account,mate-workspace | 已确认的 spec/task 与范围',
   '批准任务 <任务ID>  — 确认该条任务的仓与读/写范围；不授予合并/部署权限',
+  '授权动作 <任务ID> 验证,提交  — 额外允许本地受审验证程序/提交；默认无，不允许发布/合并',
   '开始夜班 截止 2026-11-10T07:00:00+08:00  — 必须是未来 12 小时内的明确截止时间',
   '状态 / 队列 / 帮助',
   '暂停 / 我要接班 / 取消任务 <任务ID>',
@@ -22,6 +23,12 @@ export function parseNightCommand(text: string): Command {
   if (value === '确认恢复') return { type: 'recover', acknowledged: true }
   const task = /^(批准任务|取消任务)\s+([A-Za-z0-9_-]{1,100})$/u.exec(value)
   if (task) return { type: task[1] === '批准任务' ? 'approve' : 'cancel', taskId: task[2]! }
+  const actions = /^授权动作\s+([A-Za-z0-9_-]{1,100})\s+(验证|提交|发布)(?:[,，](验证|提交|发布))*$/u.exec(value)
+  if (actions) {
+    const names = value.split(/\s+/u).at(-1)!.split(/[,，]/u)
+    const map = { 验证: 'validate', 提交: 'commit', 发布: 'publish' } as const
+    return { type: 'authorize-actions', taskId: actions[1]!, actions: [...new Set(names.map(n => map[n as keyof typeof map]))] }
+  }
   const start = /^开始夜班\s+截止\s+(\S+)$/u.exec(value)
   if (start) {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})$/.test(start[1]!) || !Number.isFinite(Date.parse(start[1]!))) {

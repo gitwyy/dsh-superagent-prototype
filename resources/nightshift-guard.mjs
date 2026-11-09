@@ -7,8 +7,9 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { constants, closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { createActions } from './nightshift-actions.mjs'
 
-const TOOLS = ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write']
+const TOOLS = ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'night_action']
 const MAX_FILE = 1024 * 1024
 const MAX_OUTPUT = 32 * 1024
 const SAFE_GIT = ['--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'credential.helper=']
@@ -229,6 +230,7 @@ export function createGuard(policy) {
 export default function nightshiftGuard(pi) {
   const policy = JSON.parse(process.env.NIGHTSHIFT_POLICY ?? 'null')
   const guard = createGuard(policy)
+  const actions = policy.actions?.length ? createActions(policy, guard) : undefined
   let ready = false
   let queue = Promise.resolve()
   const blocked = ctx => { ready = false; ctx.ui.setStatus('nightshift-guard', `${policy.runId}:blocked`) }
@@ -249,6 +251,7 @@ export default function nightshiftGuard(pi) {
     }
   })
   const definitions = [
+    ['night_action', 'Run a separately approved fixed validation recipe or scoped local commit. No arbitrary commands. Publication is disabled; validation failures are evidence, not success.', schema({ action: { type: 'string', enum: ['validate', 'commit', 'publish'] }, repository: string('Task-approved repository alias'), recipe: string('Operator-configured validation name'), message: string('Commit message; only for commit'), title: string('MR title; publication currently disabled'), description: string('MR description; publication currently disabled') }, ['action', 'repository'])],
     ['read', 'Read repository text with line numbers; credential and metadata paths are excluded.', schema({ path: string('Absolute or workspace-relative file'), offset: number, limit: number }, ['path'])],
     ['ls', 'List approved repository directory entries, excluding protected paths.', schema({ path: string('Absolute or workspace-relative directory') }, ['path'])],
     ['find', 'Find repository paths by literal substring (not glob); bounded to 500 files and 100 matches.', schema({ path: string('Approved directory'), pattern: string('Literal path substring') }, ['path', 'pattern'])],
@@ -263,6 +266,13 @@ export default function nightshiftGuard(pi) {
         const operation = queue.then(async () => {
           try {
             if (!ready || signal?.aborted) throw new Error('Guard not ready or operation cancelled')
+            if (name === 'night_action') {
+              if (!actions) throw new Error('No separately approved actions are available')
+              const result = await actions.execute(input, signal)
+              if (result.outcome === 'unknown') { ready = false; ctx.ui.setStatus('nightshift-guard', `${policy.runId}:unknown`) }
+              else if (result.outcome === 'blocked') blocked(ctx)
+              return { ...textResult(JSON.stringify(result)), isError: result.outcome !== 'succeeded' }
+            }
             return await guard.execute(name, input, signal)
           } catch (error) {
             blocked(ctx)

@@ -9,7 +9,8 @@ This opt-in execution mode uses the existing Superagent Feishu Source and durabl
 - Only allowlisted human direct messages are accepted. Group chats, bot messages, unknown senders and non-Feishu inputs never reach the legacy executor.
 - Persistent SQLite inbox/state/outbox deduplicates messages and preserves uncertain results. Conservative locks never auto-steal a stale reservation: a dead supervisor may have left a writer alive.
 - Pause/hand-off revokes dispatch, cancels the current run and verifies the POSIX process group is gone. Uncertainty enters `RECOVERY_REQUIRED`, not a false safe hand-off.
-- **This first runner does not run build/test scripts, commit, push, open MRs, deploy, access MCP, or spawn subagents.** It can read scoped text, create an approved `sdd/` or `agent/` branch, and edit scoped files. Dirty results block subsequent write admission until reviewed. This is a control-plane/guarded-execution milestone, not complete autonomous overnight refactor delivery.
+- **Push/MR publication, deployment, MCP and subagents remain disabled.** The runner reads scoped text, creates approved `sdd/` or `agent/` branches and edits scoped files. Optional `night_action` validation and local commit require a separate `授权动作` message plus locally pinned repository recipes. Nothing is enabled merely by the token's permissions. Dirty results still block the next task unless committed through approved checks or reviewed by a person. This is not yet complete autonomous overnight refactor delivery.
+- Validation recipes execute operator-reviewed programs with normal OS permissions, not in a sandbox. Executable/source SHA256 pins prevent silent recipe replacement but do not prove that code is safe. Defaults configure no recipes. Validation receipts bind current source/HEAD/pins; changed source invalidates them. Commits enumerate only approved paths and never amend/reset/merge. Uncertain mutations require manual recovery, not retries.
 - The Pi tool policy is not an OS sandbox. It cannot prevent an operator or unrelated same-user process from modifying the same directories. Human and automated writers must obey the same hand-off discipline.
 - Actual mate-pi skills and prompt templates are loaded explicitly; ambient extensions, MCP, background subagents and group notification scripts are disabled. No silent bypass of a blocked skill step.
 
@@ -21,6 +22,7 @@ This opt-in execution mode uses the existing Superagent Feishu Source and durabl
 入队 只读 mate-workspace | 阅读已确认 spec，列出下一步；不改文件
 入队 修改 mate-account,mate-workspace | 执行明确批准的 spec/task；说明目标与验收
 批准任务 <task-id>
+授权动作 <task-id> 验证,提交
 开始夜班 截止 2026-11-10T07:00:00+08:00
 暂停
 我要接班
@@ -82,7 +84,7 @@ Rollback: stop only the owning nightshift host; confirm Pi group termination/loc
 
 ## Remaining before full overnight delivery
 
-1. Brokered build/test and commit/push/MR operations with per-task approval and repository/scope validation, rather than arbitrary shell access.
+1. Configure and independently validate project-specific build/test recipes; implement pinned dedicated publication identity and bounded push/MR operations. Validation/commit broker exists, publication intentionally fails closed.
 2. Owned dirty-change checkpoints and safe continuation between steps in a single task.
 3. Remote approval/SDD confirmation correlation and independent verification/handoff evidence.
 4. End-to-end private-message execution after the user explicitly queues, approves and starts a bounded v2 task.

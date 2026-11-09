@@ -120,7 +120,7 @@ const TEXT = {
   'tab.execution': ['执行', 'Execution'],
   // Overview
   nightshiftTitle: ['Mate v2 单会话夜班', 'Mate v2 single-session nightshift'],
-  nightshiftHint: ['仅通过白名单飞书私聊控制；白天不自动执行。接班必须等待写入进程退出确认。当前受限执行器不执行构建、提交、推送或建 MR。', 'Controlled through allowlisted Feishu DMs only. Daytime does not auto-run. Handoff requires verified writer exit. Restricted runner does not build, commit, push, or create MRs.'],
+  nightshiftHint: ['仅通过白名单飞书私聊控制；白天不自动执行。接班必须等待写入进程退出确认。验证/提交须另行授权且配置受审命令；推送与建 MR 尚未启用。', 'Controlled through allowlisted Feishu DMs only. Daytime does not auto-run. Handoff requires verified writer exit. Validation/commit need separate approval and pinned recipes; publication remains disabled.'],
   nightshiftDeadline: ['夜间授权截止', 'Shift authorization deadline'],
   nightshiftTasks: ['夜班任务队列', 'Nightshift task queue'],
   nightshiftApproved: ['已批准', 'Approved'],

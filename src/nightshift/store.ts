@@ -94,11 +94,12 @@ export class NightStore {
         workspace: this.workspace, repositories: Object.entries(config.repositories).sort(([a], [b]) => a.localeCompare(b)),
         piExecutable: config.piExecutable, piHome: config.piHome, sessionFile: config.sessionFile,
         harnessRoot: config.harnessRoot, provider: config.provider, model: config.model, thinking: config.thinking,
+        repositoryActions: config.repositoryActions ?? {},
       })).digest('hex')
       if (!state) this.save({ version: 1, workspace: this.workspace, authorizationKey, mode: 'DAY_MANUAL', writerStopped: true, stopRequests: [], problems: [], tasks: [] })
       else if (state.authorizationKey !== authorizationKey) {
         // Host changes are trusted, but they do not silently inherit a person's old write approval.
-        for (const task of state.tasks) if (task.state === 'queued') { task.approved = false; delete task.approveMessageId }
+        for (const task of state.tasks) if (task.state === 'queued') { task.approved = false; delete task.approveMessageId; delete task.actions; delete task.actionsApproveMessageId }
         state.authorizationKey = authorizationKey
         state.mode = 'RECOVERY_REQUIRED'
         state.problems = ['固定执行器/仓库配置已变更；排队任务授权已撤销，必须人工核查恢复。']

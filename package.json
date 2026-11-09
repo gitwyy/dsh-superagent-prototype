@@ -27,6 +27,7 @@
     "README.md",
     "prompts",
     "resources/nightshift-guard.mjs",
+    "resources/nightshift-actions.mjs",
     "skills"
   ],
   "dsh": {

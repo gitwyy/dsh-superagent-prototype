@@ -6,6 +6,16 @@ import type { NightConfig } from './contracts.ts'
 
 const absolute = z.string().min(1).refine(isAbsolute, 'absolute path required')
 const iso = z.string().datetime({ offset: true })
+const alias = z.string().regex(/^[a-z][a-z0-9-]*$/)
+const pinPath = z.string().min(1).refine(p => !isAbsolute(p) && !p.split('/').includes('..') && !p.includes('\0'), 'repository-relative pin required')
+const recipe = z.object({
+  executable: absolute,
+  executableSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  args: z.array(z.string().max(4096)).max(64),
+  timeoutSeconds: z.number().int().min(1).max(7200),
+  pinnedFiles: z.record(pinPath, z.string().regex(/^[a-f0-9]{64}$/)).refine(p => Object.keys(p).length > 0, 'at least one pinned recipe file required'),
+  env: z.record(z.string().regex(/^[A-Z][A-Z0-9_]*$/), z.string().max(4096)).optional(),
+}).strict()
 export const NightConfigSchema = z.object({
   enabled: z.boolean().default(false),
   acceptAfter: iso.optional(),
@@ -16,7 +26,17 @@ export const NightConfigSchema = z.object({
   sessionFile: absolute,
   harnessRoot: absolute.optional(),
   lockRoot: absolute.optional(),
-  repositories: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), absolute),
+  repositories: z.record(alias, absolute),
+  repositoryActions: z.record(alias, z.object({
+    validations: z.record(alias, recipe),
+    requiredValidations: z.array(alias).min(1),
+    author: z.object({ name: z.string().min(1).max(100), email: z.string().email() }).strict(),
+    targetBranch: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/),
+    remoteUrl: z.string().url().optional(),
+    glabExecutable: absolute.optional(),
+    gitlabProject: z.string().regex(/^[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+$/).optional(),
+    gitlabHost: z.string().regex(/^[a-zA-Z0-9.-]+(?::\d+)?$/).optional(),
+  }).strict().refine(c => c.requiredValidations.every(name => Object.hasOwn(c.validations, name)), 'required validation recipe missing')).optional(),
   provider: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
   thinking: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
@@ -57,6 +77,7 @@ export function loadNightConfig(file: string): NightConfig {
     repositories[name] = canonical
   }
   if (!Object.keys(repositories).length) throw new Error('Nightshift requires an explicit repository allowlist')
+  if (Object.keys(c.repositoryActions ?? {}).some(name => !Object.hasOwn(repositories, name))) throw new Error('Action configuration names an unregistered repository')
   const executable = realpathSync(c.piExecutable)
   if (!statSync(executable).isFile()) throw new Error('piExecutable is not a file')
   return { ...c, workspace, stateDir: canonicalTarget(stateDir), sessionFile: canonicalTarget(sessionFile),

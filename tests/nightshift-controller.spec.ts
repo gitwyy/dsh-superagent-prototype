@@ -69,6 +69,22 @@ describe('nightshift durable authorization and serial dispatch', () => {
     expect(controller.snapshot().activeRunId).toBe(calls[0]!.request.runId)
   })
 
+  it('requires separate explicit actions and configured recipes; publication remains denied', async () => {
+    const policy = { validations: { check: { executable: '/bin/true', executableSha256: 'a'.repeat(64), args: [], timeoutSeconds: 1, pinnedFiles: { 'test.txt': 'b'.repeat(64) } } }, requiredValidations: ['check'], author: { name: 'Agent', email: 'agent@example.invalid' }, targetBranch: 'master' }
+    const { controller } = harness({ repositoryActions: { repo: policy } })
+    const id = await task(controller, false)
+    await command(controller, { type: 'authorize-actions', taskId: id, actions: ['validate', 'commit'] })
+    expect(controller.snapshot().tasks[0]!.actions).toBeUndefined()
+    await command(controller, { type: 'approve', taskId: id })
+    await command(controller, { type: 'authorize-actions', taskId: id, actions: ['validate', 'commit'] }, input(undefined, { actorId: 'other' }))
+    expect(controller.snapshot().tasks[0]!.actions).toBeUndefined()
+    await command(controller, { type: 'authorize-actions', taskId: id, actions: ['validate', 'commit'] })
+    expect(controller.snapshot().tasks[0]!.actions).toEqual(['validate', 'commit'])
+    await command(controller, { type: 'authorize-actions', taskId: id, actions: ['publish'] })
+    expect(controller.snapshot().tasks[0]!.actions).not.toContain('publish')
+    expect(texts(controller)).toContain('发布尚未启用')
+  })
+
   it('does not dispatch or grant authorization when disabled', async () => {
     const { controller, calls, runner } = harness({ enabled: false })
     await command(controller, { type: 'enqueue', text: 'write', repositories: ['repo'], access: 'write' })

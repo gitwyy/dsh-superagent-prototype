@@ -1,6 +1,29 @@
 /** Night-shift boundaries. No dependency on DSH/Feishu: the adapter owns transport and authentication. */
 export type ShiftMode = 'DAY_MANUAL' | 'NIGHT_RUNNING' | 'HANDOFF_PENDING' | 'NIGHT_PAUSED' | 'RECOVERY_REQUIRED'
 export type TaskState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'blocked' | 'unknown'
+export type ActionName = 'validate' | 'commit' | 'publish'
+/** Local operator-owned recipes; never accepted from model arguments. Validation executes trusted code, not a sandbox. */
+export interface ValidationRecipe {
+  executable: string
+  executableSha256: string
+  args: string[]
+  timeoutSeconds: number
+  /** Repository-relative recipe files pinned by SHA256; refuses recipe drift. */
+  pinnedFiles: Record<string, string>
+  env?: Record<string, string>
+}
+export interface RepositoryActions {
+  validations: Record<string, ValidationRecipe>
+  /** All of these recipes must pass against unchanged source content before commit/publish. */
+  requiredValidations: string[]
+  author: { name: string; email: string }
+  targetBranch: string
+  remoteUrl?: string
+  /** Absolute trusted glab wrapper with a dedicated identity; no token in this configuration. */
+  glabExecutable?: string
+  gitlabProject?: string
+  gitlabHost?: string
+}
 export interface NightConfig {
   enabled: boolean
   workspace: string
@@ -13,6 +36,7 @@ export interface NightConfig {
   /** Shared canonical-workspace lock namespace, outside business repositories. */
   lockRoot?: string
   repositories: Record<string, string>
+  repositoryActions?: Record<string, RepositoryActions>
   provider?: string
   model?: string
   thinking?: string
@@ -31,6 +55,9 @@ export interface Task {
   access: 'read' | 'write'
   approved: boolean
   approveMessageId?: string
+  /** Separately approved host-broker actions. Legacy tasks default to no actions. */
+  actions?: ActionName[]
+  actionsApproveMessageId?: string
   target: ReplyTarget
   state: TaskState
   createdAt: string
@@ -67,6 +94,7 @@ export type Command =
   | { type: 'status' | 'help' | 'pause' | 'handoff' }
   | { type: 'enqueue'; text: string; repositories: string[]; access: 'read' | 'write' }
   | { type: 'approve'; taskId: string }
+  | { type: 'authorize-actions'; taskId: string; actions: ActionName[] }
   | { type: 'cancel'; taskId: string }
   | { type: 'start'; deadline: string }
   | { type: 'recover'; acknowledged: boolean }

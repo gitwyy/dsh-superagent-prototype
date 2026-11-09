@@ -143,7 +143,7 @@ class Controller implements NightController {
           return
         }
         if (command.type === 'status') {
-          const tasks = state.tasks.slice(-10).map(task => `${task.id} ${task.state} [${task.repositories.join(',')}/${task.access}/${task.approved ? '已批准' : '待批准'}] ${task.text.replace(/\s+/g, ' ').slice(0, 100)}`)
+          const tasks = state.tasks.slice(-10).map(task => `${task.id} ${task.state} [${task.repositories.join(',')}/${task.access}/${task.approved ? '已批准' : '待批准'}/动作:${task.actions?.join(',') || '无'}] ${task.text.replace(/\s+/g, ' ').slice(0, 100)}`)
           reply(`${state.mode}｜排队 ${state.tasks.filter(task => task.state === 'queued').length}｜运行 ${state.activeRunId ?? '无'}｜截止 ${state.deadline ?? '无'}\n${tasks.join('\n')}${state.problems.length ? `\n注意：${state.problems.join('；')}` : ''}`); return
         }
         if (command.type === 'help') { reply(NIGHT_HELP); return }
@@ -169,6 +169,21 @@ class Controller implements NightController {
           const task: Task = { id: randomUUID(), originId: input.id, ownerId: input.actorId, text: command.text, repositories: [...new Set(command.repositories)], access: command.access, approved: false, target: input.target, state: 'queued', createdAt: iso() }
           state.tasks.push(task)
           reply(`已排队 ${task.id}｜${task.repositories.join(',')}｜${task.access}。需任务所有者明确批准；添加任务不会启动夜间执行。`)
+        } else if (command.type === 'authorize-actions') {
+          const task = state.tasks.find(item => item.id === command.taskId)
+          if (!task || task.ownerId !== input.actorId || task.state !== 'queued' || !task.approved || state.mode === 'RECOVERY_REQUIRED') {
+            reply('拒绝：只有任务所有者可为已批准的排队任务授权额外动作。'); return
+          }
+          if (!command.actions.length || command.actions.some(a => !['validate', 'commit', 'publish'].includes(a))
+            || (task.access !== 'write' && command.actions.some(a => a !== 'validate'))) {
+            reply('拒绝：动作范围无效，提交/发布还要求任务 write 权限。'); return
+          }
+          const missing = task.repositories.filter(repo => !this.config.repositoryActions?.[repo])
+          if (missing.length) { reply(`拒绝：仓库尚无本地受审动作配置：${missing.join(',')}。`); return }
+          if (command.actions.includes('publish')) { reply('发布尚未启用：需先验证专用发布身份与远端边界；未授予 publish。'); return }
+          task.actions = [...new Set(command.actions)]
+          task.actionsApproveMessageId = input.id
+          reply(`已授权动作 ${task.id}：${task.actions.join(',')}。验证会执行本地配置中固定的受信任程序；不授予任意 shell、合并、部署或群消息权限。`)
         } else if (command.type === 'approve' || command.type === 'cancel') {
           const task = state.tasks.find(item => item.id === command.taskId)
           if (!task || task.ownerId !== input.actorId) { reply('拒绝：任务不存在，或发送者不是任务所有者。'); return }
