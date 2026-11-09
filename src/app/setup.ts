@@ -5,6 +5,7 @@ import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, resolveGitlab, worke
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
+import { loadNightConfig } from '../nightshift/config.ts'
 
 export interface SetupHost {
   readonly context: Context
@@ -66,7 +67,7 @@ export class Setup {
     await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
-    if (this.resolved) await writeEnvironment(this.resolved, blocked)
+    if (this.resolved && !this.host.machine.nightshiftConfig) await writeEnvironment(this.resolved, blocked)
   }
   restore(): void { this.restoreEnvironment?.(); this.restoreEnvironment = undefined }
   /** Probes CLIs the way worker shells run them, using `stateDir` as `cwd` since it exists even before the repository clone is valid. */
@@ -77,6 +78,14 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
+    if (machine.nightshiftConfig) {
+      const night = loadNightConfig(machine.nightshiftConfig)
+      // This mode delegates to the fixed pi environment. It needs only the bot transport, never a project token
+      // or process-wide Git credential/PATH rewrite. In particular, do not reuse the Mate 1.0 bot identity.
+      const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe)
+      if (!feishu) throw new SetupError('feishuCliFailed', { output: 'Nightshift requires its dedicated bot CLI' })
+      return { ...machine, vcs: 'gitlab', repository: night.workspace, feishu }
+    }
     // The deployment works through one VCS Source: a GitHub account is read even while its Source is off, as it always
     // was, and a GitLab Source is read while it is on. A deployment that configures neither keeps the GitHub Source's
     // setup problem.

@@ -290,6 +290,14 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 
 | Path | Responsibility |
 | --- | --- |
+| `src/nightshift/contracts.ts` | Fixed-workspace supervisor, task, reply and runner contracts; explicit read/write scope |
+| `src/nightshift/config.ts` | Local trusted nightshift config loading, canonical paths and repository boundaries |
+| `src/nightshift/commands.ts` | Bounded Chinese private-message control parser; no implicit task grants |
+| `src/nightshift/store.ts` | Durable SQLite inbox/state/outbox and conservative state/workspace reservations |
+| `src/nightshift/controller.ts` | Serial queue, task approvals, shift deadlines, freeze fences and verified-stop handoff |
+| `src/nightshift/pi-runner.ts` | Fixed-cwd persistent-session Pi RPC process-group supervisor |
+| `src/nightshift/preflight.ts` | Repository/session/runtime inspection and isolated worker environment |
+| `src/nightshift/adapter.ts` | Authenticated DM ingress and durable transfer to the existing Feishu Outbox |
 | `src/index.ts` | The main plugin entry: reads the machine settings, starts the Runtime, and gives it the restart that a save of a Source's account uses |
 | `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment`, `resolveGitlab` and `resolveFeishuBot` read the repository, the project and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
 | `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it and the English text the log, the main Session and the panel share |
@@ -409,6 +417,9 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 
 | Test | Covers |
 | --- | --- |
+| `tests/nightshift-controller.spec.ts` | Durable task authorization, serial dispatch, cancellation races, locks and restart ambiguity |
+| `tests/nightshift-runner.spec.ts` | Fake Pi RPC lifecycle and scoped guard execution in disposable repositories |
+| `tests/nightshift-adapter.spec.ts` | DM-only authentication, parser/config boundaries, pause and message idempotency |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |

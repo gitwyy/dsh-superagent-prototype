@@ -6,6 +6,16 @@ import { usePanel, mount, remount, all, find, tab, click, text } from './fixture
 import { server, droppedReply, threadSummary } from './fixtures/panel-server.ts'
 
 usePanel()
+it('shows fixed-workspace manual mode without pretending the legacy ticket counters are its queue', async () => {
+  server.nightshift = { enabled: true, workspace: '/fixed/mate-workspace', sessionFile: '/state/pi.jsonl',
+    repositories: ['mate-workspace'], mode: 'DAY_MANUAL', tasks: [], problems: [] }
+  await mount()
+  expect(text()).toContain('Mate v2 单会话夜班')
+  expect(text()).toContain('DAY_MANUAL')
+  expect(text()).toContain('/fixed/mate-workspace')
+  expect(text()).toContain('当前受限执行器不执行构建、提交、推送或建 MR')
+  expect(text()).not.toContain('过去 24 小时')
+})
 it('leads the overview with the pending Tickets, then problems, the last day and the Executor, each linking to its stage', async () => {
   await mount()
   expect(tab(zh['tab.overview']).getAttribute('aria-selected')).toBe('true')

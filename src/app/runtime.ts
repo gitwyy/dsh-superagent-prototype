@@ -47,6 +47,10 @@ import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
 import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
+import { loadNightConfig } from '../nightshift/config.ts'
+import { NightAdapter } from '../nightshift/adapter.ts'
+import { createPiRunner } from '../nightshift/pi-runner.ts'
+import { packagePath } from '../infra/paths.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
@@ -85,6 +89,9 @@ export class Runtime extends Service implements SourceHost {
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
+  private night?: NightAdapter
+  /** Capture before Setup applies process-wide bot/git shims; pi runner independently filters its environment. */
+  private readonly originalEnvironment = { ...process.env }
   constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
     super(ctx, 'orchestrator')
     const runtime = this
@@ -108,7 +115,7 @@ export class Runtime extends Service implements SourceHost {
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
-      const effects = this.effects = new Effects(store, board)
+      const effects = this.effects = new Effects(store, board, () => Date.now(), kind => !machine.nightshiftConfig || kind === 'reply')
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
@@ -134,7 +141,8 @@ export class Runtime extends Service implements SourceHost {
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
-      const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
+      const outbox = this.outbox = new Outbox({ store, effects, sources, commands,
+        paused: () => machine.nightshiftConfig ? !setup.configured() : this.paused() })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
@@ -161,10 +169,10 @@ export class Runtime extends Service implements SourceHost {
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
-        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
+        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured() && !machine.nightshiftConfig, closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
-        get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
+        get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => this.night ? this.night.receive(trigger) : passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         get gitlab() { return runtime.context({ kind: 'gitlab', health: ['gitlab'] }) },
@@ -199,18 +207,37 @@ export class Runtime extends Service implements SourceHost {
     return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
   }
   checkSetup(): void { this.setup.check() }
-  receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
+  receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult> { return this.night ? this.night.receive(trigger) : this.passes.receive(trigger) }
+  nightshiftSnapshot() { return this.night?.snapshot() }
   idle(): Promise<void> { return this.passes.idle() }
   pump(): Promise<void> { return this.passes.pump() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
   private closing(): boolean { return this.closingFlag }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
-  private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
+  private paused(): boolean { return !!this.machine.nightshiftConfig || !this.setup.configured() || this.store.settings().paused }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
+      return
+    }
+    if (this.machine.nightshiftConfig) {
+      // Dedicated mode owns the private-message channel exclusively. Old tickets must never resume against a new workspace.
+      if (this.store.tickets.open().length) throw new Error('Nightshift requires an empty ticket queue or a separate stateDir; resolve old tickets before switching')
+      const settings = this.store.settings()
+      const fs = settings.sources.feishu?.config
+      if (!settings.sources.feishu?.enabled || !fs || fs.directMessages !== true || fs.otherChats !== 'none'
+        || !Array.isArray(fs.chats) || fs.chats.length !== 0) throw new Error('Nightshift requires Feishu direct messages only, with no chats or otherChats')
+      if (Object.entries(settings.sources).some(([id, value]) => id !== 'feishu' && value.enabled)) {
+        throw new Error('Nightshift mode requires every non-Feishu source disabled (deployment credentials can remain configured)')
+      }
+      const config = loadNightConfig(this.machine.nightshiftConfig)
+      this.night = new NightAdapter({ config, runner: createPiRunner({ baseEnvironment: this.originalEnvironment, guardPath: packagePath('resources', 'nightshift-guard.mjs') }),
+        settings: () => this.store.settings(), outbox: this.outbox, health: this.board.claim('nightshift') })
+      // Only durable reply effects run. No LLM assessor, DSH worker or old ticket continuation is installed.
+      this.effects.start()
+      this.runtimeHealth.set({ state: 'ready', detail: 'Fixed-workspace nightshift control ready; DAY_MANUAL by default', at: now() })
       return
     }
     this.sessions.install()
@@ -228,6 +255,7 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+      nightshift: () => runtime.nightshiftSnapshot(),
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
@@ -237,7 +265,11 @@ export class Runtime extends Service implements SourceHost {
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
     this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
+    let nightFailure: unknown
     try {
+      try { await this.night?.close() } catch (error) { nightFailure = error }
+      // Even if nightshift reports a shutdown/persistence failure, drain host effects and transports.
+      // The night controller retains its reservations on uncertainty; host cleanup does not claim safe handoff.
       this.assessor.stop()
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
@@ -249,6 +281,7 @@ export class Runtime extends Service implements SourceHost {
       this.sessions.dispose()
       for (const dispose of this.disposers.reverse()) dispose()
       await this.ctx.sessionPersistence.flush()
+      if (nightFailure) throw nightFailure
     } finally {
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
       this.setup.restore()

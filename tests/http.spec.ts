@@ -25,6 +25,17 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
   }
 }
 
+it('blocks legacy task/control mutations in dedicated nightshift mode', async () => {
+  const call = serve({ machine: { nightshiftConfig: '/private/night.json' },
+    store: { tickets: { get: () => { throw new Error('legacy mutation reached domain') } } },
+    settings: { pause: async (paused: boolean) => ({ paused }) } })
+  for (const path of ['tickets/old/retry', 'tickets/old/stop', 'triggers/old/requeue', 'setup/check']) {
+    expect(await call('POST', path)).toMatchObject({ status: 400 })
+  }
+  expect(await call('PUT', 'settings/source:gitlab', { value: {}, revision: 0 })).toMatchObject({ status: 400 })
+  expect(await call('POST', 'executor/pause', { paused: true })).toMatchObject({ status: 200, body: { paused: true } })
+})
+
 it('answers each kind of failure with its own status', async () => {
   const saves: unknown[] = []
   const call = serve({

@@ -1,6 +1,6 @@
 import { Context } from '@deepseek-ai/cordis'
 import { bindScopeParent } from '@deepseek-ai/dsh-scope'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
@@ -215,6 +215,37 @@ beforeEach(async () => {
   deliveries.mockClear()
 })
 afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+
+it('dedicated nightshift routes DM controls without creating DSH agents, tickets, or VCS shims', async () => {
+  await runtime.stop()
+  const workspace = join(directory, 'night-ws'); mkdirSync(workspace)
+  const configFile = join(directory, 'night-config.json')
+  writeFileSync(configFile, JSON.stringify({ enabled: true, workspace: realpathSync(workspace),
+    stateDir: join(realpathSync(directory), 'night-state'), lockRoot: join(realpathSync(directory), 'night-locks'),
+    piExecutable: process.execPath, piHome: realpathSync(directory), sessionFile: join(realpathSync(directory), 'night-state/session.jsonl'),
+    repositories: { workspace: realpathSync(workspace) }, maxTaskSeconds: 120, freezeWindows: [] }))
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  store.saveSettings(SettingsSchema.parse({ sources: { feishu: { enabled: true,
+    config: { cli: BOT(), chats: [], directMessages: true, otherChats: 'none' } } },
+    policy: { sources: { feishu: { allowed: [{ id: MEMBER }] } } } }))
+  store.db.prepare('INSERT INTO effect(kind,key,value,seq,generation,attempts,error,due,since) VALUES(?,?,?,?,0,0,\'\',0,\'\')')
+    .run('relay', 'old-mode-relay', JSON.stringify({ text: 'old worker continuation must not run' }), 1)
+  store.close(); controller.create.mockClear(); subprocess.spawn.mockClear(); deliveries.mockClear()
+  const ctx = new Context()
+  for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
+  runtime = new Runtime(ctx, testMachine({ stateDir: directory, nightshiftConfig: configFile }), restarts)
+  await runtime.ready; runtime.sources.register(feishuKind)
+  const input = feishu('night-status', '状态', { chat_type: 'p2p' })
+  expect(await runtime.receive(input)).toBe('stored')
+  expect(await runtime.receive(feishu('night-group', '入队 修改 workspace | do it'))).toBe('filtered')
+  expect(runtime.nightshiftSnapshot()?.mode).toBe('DAY_MANUAL')
+  expect(runtime.store.tickets.list()).toHaveLength(0)
+  expect(controller.create).not.toHaveBeenCalled()
+  await runtime.effects.idle()
+  expect(deliveries).not.toHaveBeenCalled()
+  expect(runtime.effects.pending('relay', 'old-mode-relay')).toBe(true)
+  expect(subprocess.spawn.mock.calls.every(([spec]) => !spec.argv.includes('git'))).toBe(true)
+})
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()

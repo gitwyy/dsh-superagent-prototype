@@ -1,0 +1,21 @@
+{
+  "enabled": false,
+  "workspace": "/absolute/path/to/mate-workspace",
+  "stateDir": "/absolute/private-state/mate-v2/nightshift",
+  "sessionFile": "/absolute/private-state/mate-v2/nightshift/pi-session.jsonl",
+  "piExecutable": "/absolute/path/to/pi",
+  "piHome": "/absolute/dedicated-pi-home",
+  "harnessRoot": "/absolute/path/to/mate-pi",
+  "lockRoot": "/absolute/shared-workspace-locks",
+  "repositories": {
+    "mate-workspace": "/absolute/path/to/mate-workspace",
+    "mate-account": "/absolute/path/to/mate-workspace/new/mate-account"
+  },
+  "provider": "mate-newapi",
+  "model": "gpt-6-astra",
+  "thinking": "low",
+  "maxTaskSeconds": 1800,
+  "freezeWindows": [
+    { "from": "2026-11-12T00:00:00+08:00", "until": "2026-11-14T00:00:00+08:00" }
+  ]
+}

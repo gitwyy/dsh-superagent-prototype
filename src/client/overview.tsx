@@ -60,7 +60,7 @@ function ProblemLine({ problem, onChanged }: { problem: Problem; onChanged: () =
 
 export function OverviewPage() {
   const { t, call, navigate } = usePanel()
-  const { setup } = usePanelData()
+  const { setup, state } = usePanelData()
   const { data, error, reload } = usePoll(() => call('GET overview'), [])
   if (!data) return <LoadState error={error} loading />
   const stat = (label: string, value: ReactNode, route?: Route) => <span className="dt-stat">
@@ -70,6 +70,27 @@ export function OverviewPage() {
   </span>
   const more = (route: Route) => <button type="button" className="dt-textlink dt-more-link"
     onClick={() => navigate(route)}>{t('details')}</button>
+  if (state?.nightshift) {
+    const night = state.nightshift
+    return <>
+      <Section title={t('nightshiftTitle')}>
+        <p className="dt-mono">{night.mode}</p>
+        <Hint>{t('nightshiftHint')}</Hint>
+        <p className="dt-mono">{night.workspace}</p>
+        <p>{t('nightshiftDeadline')}: {night.deadline ?? '—'}</p>
+        {night.problems.map((problem, index) => <p key={index} className="dt-error">{problem}</p>)}
+      </Section>
+      <Section title={t('nightshiftTasks')} count={night.tasks.length}>
+        <ul className="dt-list">{night.tasks.slice(-30).reverse().map(task => <li className="dt-row" key={task.id}>
+          <div className="dt-row-main"><strong>{task.text.slice(0, 160)}</strong>
+            <p className="dt-mono">{task.id}</p>
+            <p>{task.state} · {task.access} · {task.repositories.join(', ')} · {task.approved ? t('nightshiftApproved') : t('nightshiftUnapproved')}</p>
+            {task.result && <p>{task.result.summary}</p>}
+          </div>
+        </li>)}</ul>
+      </Section>
+    </>
+  }
   return <>
     {error && <LoadState error={error} loading={false} />}
     <Section title={t('pendingTickets')} count={data.person.length}>

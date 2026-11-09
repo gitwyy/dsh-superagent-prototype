@@ -99,6 +99,7 @@ export interface PanelServer {
   queued: Set<string>
   searching?: (query: string) => Promise<void>
   setup: SetupView
+  nightshift?: StateView['nightshift']
   health: Record<string, Health>
   /** When true, all API requests return an empty 404 to simulate the host plugin being stopped. */
   down: boolean
@@ -160,6 +161,7 @@ function sourceStatuses(): SourceStatusRow[] {
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
   masterId: 'master', paused: server.settings.paused,
+  ...(server.nightshift ? { nightshift: server.nightshift } : {}),
   // The panel does not read health; the service script does.
   health: {},
 })

@@ -119,6 +119,12 @@ const TEXT = {
   'tab.eval': ['评估', 'Eval'],
   'tab.execution': ['执行', 'Execution'],
   // Overview
+  nightshiftTitle: ['Mate v2 单会话夜班', 'Mate v2 single-session nightshift'],
+  nightshiftHint: ['仅通过白名单飞书私聊控制；白天不自动执行。接班必须等待写入进程退出确认。当前受限执行器不执行构建、提交、推送或建 MR。', 'Controlled through allowlisted Feishu DMs only. Daytime does not auto-run. Handoff requires verified writer exit. Restricted runner does not build, commit, push, or create MRs.'],
+  nightshiftDeadline: ['夜间授权截止', 'Shift authorization deadline'],
+  nightshiftTasks: ['夜班任务队列', 'Nightshift task queue'],
+  nightshiftApproved: ['已批准', 'Approved'],
+  nightshiftUnapproved: ['待任务所有者批准', 'Awaiting owner approval'],
   sourceError: ['{source} 来源异常', '{source} Source failing'],
   needsYouNone: ['没有待处理的工单。', 'No pending Tickets.'],
   pendingTickets: ['待处理工单', 'Pending Tickets'],

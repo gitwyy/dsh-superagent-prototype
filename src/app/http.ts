@@ -19,6 +19,7 @@ import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
+import type { NightAdapter } from '../nightshift/adapter.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
@@ -53,6 +54,8 @@ export interface HttpHost {
   checkSetup(): void
   requestPass(): void
   models(): Promise<ModelCatalog>
+  /** Read-only fixed-workspace controller view; absent for ordinary ticket execution. */
+  nightshift?(): ReturnType<NightAdapter['snapshot']> | undefined
 }
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
@@ -107,7 +110,8 @@ export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, health: runtime.health,
+    ...(runtime.nightshift ? { nightshift: runtime.nightshift() ?? null } : {}) }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
@@ -196,6 +200,9 @@ function routes(runtime: HttpHost): Routes {
     'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),
     'PUT settings/:block': async ({ params, body }) => {
       const block = SettingsBlockSchema.parse(params.block)
+      if (runtime.machine?.nightshiftConfig && block !== 'policy') {
+        throw new RouteError(400, 'Nightshift transport/workspace is pinned by local configuration; only owner policy is editable here')
+      }
       const known = !block.startsWith('source:') || runtime.sources.instances().some(instance => `source:${instance.id}` === block)
       if (!known) throw new RouteError(404, 'Source not found')
       const request = SaveRequest.parse(await body())
@@ -238,7 +245,13 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
-        const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
+        const path = url.pathname.slice('/orchestrator/api/'.length)
+        if (runtime.machine?.nightshiftConfig && req.method !== 'GET'
+          && !(req.method === 'POST' && path === 'executor/pause')
+          && !(req.method === 'PUT' && path.startsWith('settings/'))) {
+          throw new RouteError(400, 'Nightshift uses its private-message controller; legacy ticket/domain mutations are disabled')
+        }
+        const route = match(table, req.method ?? 'GET', path.split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)
         json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
