@@ -44,6 +44,8 @@ export const NightConfigSchema = z.object({
   model: z.string().min(1).optional(),
   thinking: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
   maxTaskSeconds: z.number().int().min(10).max(14400).default(1800),
+  /** Full engine: same tools/network as a manually driven Pi; release still needs its own grant. */
+  engineMode: z.enum(['guarded', 'full']).default('guarded'),
   freezeWindows: z.array(z.object({ from: iso, until: iso }).strict()
     .refine(w => Date.parse(w.from) < Date.parse(w.until), 'freeze end must follow start')).default([]),
 }).strict()

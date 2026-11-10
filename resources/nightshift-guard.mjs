@@ -155,6 +155,23 @@ export function createGuard(policy) {
   }
   async function bash(input, signal) {
     const argv = words(input.command)
+    // Full engine mode: behave like a manually driven Pi — any simple argv (no shell
+    // operators) with the working directory pinned inside an approved task repository.
+    // Path/credential protections for edit/write/read still apply; this is not a sandbox.
+    if (policy.engineMode === 'full') {
+      if (!argv.length) throw new Error('Empty command')
+      const cwd = roots[0]
+      if (!cwd) throw new Error('No approved repository for bash')
+      return textResult(await new Promise((accept, refuse) => {
+        const child = spawn(argv[0], argv.slice(1), { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], shell: false, timeout: 120_000 })
+        let out = ''
+        child.stdout.on('data', chunk => { out = (out + chunk).slice(-1_000_000) })
+        child.stderr.on('data', chunk => { out = (out + chunk).slice(-1_000_000) })
+        child.on('error', error => refuse(error))
+        child.on('close', code => accept(`${out}${code === 0 ? '' : `\n[exit ${code}]`}`))
+        signal?.addEventListener('abort', () => { try { child.kill('SIGKILL') } catch { /* ignore */ } }, { once: true })
+      }))
+    }
     if (argv[0] !== 'git' || argv[1] !== '-C' || argv.length < 4) throw new Error('Only git -C <approved-repo> with the documented operations is supported')
     const { path, root } = checkedPath(argv[2])
     if (path !== root || !roots.includes(root)) throw new Error('Git requires an exact approved repository root')
@@ -238,7 +255,8 @@ export default function nightshiftGuard(pi) {
   pi.on('project_trust', () => ({ trusted: 'no' }))
   pi.on('session_start', (_event, ctx) => {
     if (ctx.cwd !== policy.workspace || ctx.sessionManager.getSessionFile() !== policy.sessionFile) throw new Error('Nightshift fixed workspace/session mismatch')
-    pi.setActiveTools(TOOLS)
+    // Full engine keeps Pi's own tool set; guarded mode narrows it to the audited list.
+    if (policy.engineMode !== 'full') pi.setActiveTools(TOOLS)
     ready = true
     ctx.ui.setStatus('nightshift-guard', `${policy.runId}:ready`)
   })
@@ -246,7 +264,13 @@ export default function nightshiftGuard(pi) {
   pi.on('session_before_fork', () => ({ cancel: true }))
   pi.on('user_bash', (_event, ctx) => { blocked(ctx); return { result: { output: 'User shell execution disabled', exitCode: 1, cancelled: false, truncated: false } } })
   pi.on('tool_call', (event, ctx) => {
-    if (!ready || !TOOLS.includes(event.toolName) || event.parentToolCallId) {
+    if (!ready) {
+      blocked(ctx)
+      return { block: true, reason: 'Nightshift guard is not ready', terminate: true }
+    }
+    // Full engine behaves like a manually driven Pi: other built-in tools and subagents are allowed.
+    if (policy.engineMode === 'full') return
+    if (!TOOLS.includes(event.toolName) || event.parentToolCallId) {
       blocked(ctx)
       return { block: true, reason: 'Nightshift permits only direct guarded tools', terminate: true }
     }

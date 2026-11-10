@@ -45,6 +45,8 @@ export interface NightConfig {
   model?: string
   thinking?: string
   maxTaskSeconds: number
+  /** 'guarded' (default): narrow tools/no network. 'full': same abilities as manually driven Pi. */
+  engineMode?: 'guarded' | 'full'
   freezeWindows: { from: string; until: string }[]
   /** Migration cutoff for source history: earlier messages cannot enqueue or grant work. */
   acceptAfter?: string
