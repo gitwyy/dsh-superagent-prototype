@@ -59,6 +59,8 @@ export interface Task {
   access: 'read' | 'write'
   approved: boolean
   approveMessageId?: string
+  /** Natural-language suggestions are inert until the owner explicitly confirms exact access/repositories. */
+  proposal?: { requiresScopeConfirmation: boolean; issueRefs: string[]; confirmedMessageId?: string }
   /** Separately approved host-broker actions. Legacy tasks default to no actions. */
   actions?: ActionName[]
   actionsApproveMessageId?: string
@@ -98,7 +100,13 @@ export interface Incoming {
 }
 export interface PendingReply { id: string; target: ReplyTarget; text: string }
 export type Command =
-  | { type: 'status' | 'help' | 'pause' | 'handoff' }
+  | { type: 'pause' | 'handoff' }
+  | { type: 'status'; page?: number }
+  | { type: 'help'; topic?: 'task' | 'release' | 'control' }
+  | { type: 'task-detail'; taskId: string; page?: number }
+  | { type: 'reply-detail'; replyId: string; page?: number }
+  | { type: 'propose'; text: string; repositories: string[]; access: 'read' | 'write'; issueRefs?: string[] }
+  | { type: 'confirm-task'; taskId: string; repositories: string[]; access: 'read' | 'write' }
   | { type: 'enqueue'; text: string; repositories: string[]; access: 'read' | 'write' }
   | { type: 'approve'; taskId: string }
   | { type: 'authorize-actions'; taskId: string; actions: ActionName[] }

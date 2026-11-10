@@ -136,6 +136,17 @@ export class NightStore {
   reply(id: string, target: ReplyTarget, text: string): void {
     this.db.prepare('INSERT OR IGNORE INTO outbox(id,value) VALUES(?,?)').run(id, JSON.stringify({ id, target, text }))
   }
+  replyForOwner(id: string, actor: string, chatId: string): PendingReply | undefined {
+    const row = this.db.prepare('SELECT value FROM outbox WHERE id=?').get(id)
+    if (!row) return undefined
+    const reply = JSON.parse(String(row.value)) as PendingReply
+    if (reply.target.chatId !== chatId) return undefined
+    // Ordinary receipts begin with the originating inbox id; run receipts bind through the task owner.
+    const origin = id.endsWith(':reply') ? id.slice(0, -6) : id.endsWith(':final') ? id.slice(0, -6) : undefined
+    const ownsInput = origin && this.db.prepare('SELECT 1 FROM inbox WHERE id=? AND actor=?').get(origin, actor)
+    const ownsRun = id.startsWith('run:') && this.load()?.tasks.some(task => task.ownerId === actor && task.target.chatId === chatId && id.startsWith(`run:${task.runId ?? task.id}:`))
+    return ownsInput || ownsRun ? reply : undefined
+  }
   pendingReplies(): PendingReply[] { return this.db.prepare('SELECT value FROM outbox WHERE sent=0 ORDER BY rowid').all().map(row => JSON.parse(String(row.value)) as PendingReply) }
   markReplySent(id: string): void { this.db.prepare('UPDATE outbox SET sent=1 WHERE id=?').run(id) }
   /** On uncertainty leave the workspace reservation on disk, including after this process exits. */

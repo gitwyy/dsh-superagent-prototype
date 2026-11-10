@@ -4,24 +4,30 @@ import { ReleaseScopeSchema } from './release/coordinator.ts'
 import { z } from 'zod'
 
 export const NIGHT_HELP = [
-  'Mate v2 单会话夜班（仅私聊）。默认白天人工；消息入队不等于开始执行。',
-  '任务格式：入队 只读 mate-workspace | 任务说明',
-  '写任务格式：入队 修改 mate-account,mate-workspace | 已确认的 spec/task 与范围',
-  '批准任务 <任务ID>  — 确认该条任务的仓与读/写范围；不授予合并/部署权限',
-  '授权动作 <任务ID> 验证,提交  — 额外允许本地受审验证程序/提交；默认无，不允许发布/合并',
-  '预授权发布 <任务ID> 截止 <带时区ISO时间> | <范围JSON数组>  — 指定仓库、源/目标分支、基线SHA、test环境与push/create_mr/merge/deploy动作',
-  '发布状态 / 核查发布 <操作ID>  — 只读对账，不重发远端动作',
-  '开始夜班 截止 <带时区ISO时间>  — 必须是未来 12 小时内的明确截止时间',
-  '状态 / 队列 / 帮助',
-  '暂停 / 我要接班 / 取消任务 <任务ID>',
-  '确认恢复  — 仅对已核对现场的恢复请求；未知结果的任务不会自动重跑',
-  '收到“可以接班”之前不要同时写该工作区。真实 pi 执行仍遵守 SDD 门禁；受护栏拦截的操作会等待人工。',
+  'Mate v2：私聊控制，默认白天人工。',
+  '可直接说“处理 mate-manage-web#84”，仅生成待确认任务，不授权、不启动。',
+  '查看：状态／任务详情 <ID>／发布状态。',
+  '操作：帮助 任务／帮助 发布／帮助 控制。',
+  '停止：暂停／我要接班。收到安全交接确认前，请勿同时写工作区。',
 ].join('\n')
+export const NIGHT_HELP_TOPICS = {
+  task: '明确入队：入队 修改|只读 仓名 | 任务说明。\n自然语言草案：确认任务 <ID> 修改|只读 仓名。\n确认范围后或明确入队后：批准任务 <ID>。\n查看原文：任务详情 <ID> [页码]。\n批准后仍需启动夜班；不会自动授予提交或发布。',
+  release: '本地动作：授权动作 <ID> 验证,提交。\n发布：预授权发布 <ID> 截止 <带时区ISO时间> | <范围JSON数组>。\n每项包含repository/sourceBranch/targetBranch/baseSha/environment/actions。\n动作push/create_mr/merge/deploy；应用合并必须同时授权test部署。\n查询：发布状态 [页码]／核查发布 <操作ID>。',
+  control: '开始夜班 截止 <未来12小时内带时区ISO时间>\n仅运行已批准任务；自然语言和入队均不启动。\n暂停／我要接班／取消任务 <ID>。\n确认恢复：仅用于RECOVERY_REQUIRED，须先人工核对。\n未知操作不重跑；本地退出不代表远端部署停止。',
+} as const
 
 export function parseNightCommand(text: string): Command {
   const value = text.trim()
   if (/^(?:状态|队列|进度|现在做到哪了[？?]?|\/status)$/u.test(value)) return { type: 'status' }
+  const status = /^(?:状态|队列)\s+([1-9]\d{0,3})$/u.exec(value)
+  if (status) return { type: 'status', page: Number(status[1]) }
   if (/^(?:帮助|夜班帮助|\/help)$/u.test(value)) return { type: 'help' }
+  const help = /^帮助\s+(任务|发布|控制)$/u.exec(value)
+  if (help) return { type: 'help', topic: ({ 任务: 'task', 发布: 'release', 控制: 'control' } as const)[help[1] as '任务' | '发布' | '控制'] }
+  const detail = /^(任务详情|回复详情)\s+([A-Za-z0-9_:.-]{1,180})(?:\s+([1-9]\d{0,3}))?$/u.exec(value)
+  if (detail) return detail[1] === '任务详情' ? { type: 'task-detail', taskId: detail[2]!, page: Number(detail[3] ?? 1) } : { type: 'reply-detail', replyId: detail[2]!, page: Number(detail[3] ?? 1) }
+  const confirm = /^确认任务\s+([A-Za-z0-9_-]{1,100})\s+(只读|修改)\s+([a-z][a-z0-9,-]*)$/u.exec(value)
+  if (confirm) return { type: 'confirm-task', taskId: confirm[1]!, access: confirm[2] === '只读' ? 'read' : 'write', repositories: [...new Set(confirm[3]!.split(','))] }
   if (/^(?:暂停|先暂停|暂停夜班|\/pause)$/u.test(value)) return { type: 'pause' }
   if (/^(?:我要接班|接班|交接|结束夜班|白天人工|\/handoff)$/u.test(value)) return { type: 'handoff' }
   if (value === '确认恢复') return { type: 'recover', acknowledged: true }

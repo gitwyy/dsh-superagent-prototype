@@ -465,14 +465,18 @@ describe('system suspension and strengthened fences', () => {
     expect(h.calls).toHaveLength(1)
   })
 
-  it('status lists recent actionable task IDs, titles, repositories, access and approval', async () => {
+  it('status lists bounded actionable IDs and owner-only task detail exposes full scope and text', async () => {
     const h = harness()
     const id = await task(h.controller)
     const message = await command(h.controller, { type: 'status' })
     const reply = h.controller.pendingReplies().find(reply => reply.id === `${message.id}:reply`)!.text
     expect(reply).toContain(id)
-    expect(reply).toContain('Implement and test one change')
-    expect(reply).toContain('repo/write/已批准')
+    expect(reply).toContain('queued/已批准')
+    expect(reply).toContain('任务详情')
+    const detail = await command(h.controller, { type: 'task-detail', taskId: id })
+    const full = h.controller.pendingReplies().find(reply => reply.id === `${detail.id}:reply`)!.text
+    expect(full).toContain('Implement and test one change')
+    expect(full).toContain('仓库 repo｜权限 write')
   })
 
   it('ignores groups and bots without emitting replies to their targets', async () => {

@@ -2,7 +2,8 @@
 import { randomUUID } from 'node:crypto'
 import type { Command, Incoming, NightConfig, NightController, PendingReply, RunResult, Runner, Task } from './contracts.ts'
 import { NightStore, type DurableState, type PendingCheck } from './store.ts'
-import { NIGHT_HELP } from './commands.ts'
+import { NIGHT_HELP, NIGHT_HELP_TOPICS } from './commands.ts'
+import { replyPage } from './replies.ts'
 import { policyDigest, ReleaseGrantSchema } from './release/coordinator.ts'
 
 const MAX_SHIFT_MS = 12 * 60 * 60 * 1000
@@ -122,7 +123,7 @@ class Controller implements NightController {
   private boundary(): number { return Math.min(instant(this.state.deadline ?? ''), ...this.windows.filter(window => window.from > Date.now()).map(window => window.from)) }
   private grantValid(): boolean { return this.config.enabled && !this.closing && this.state.mode === 'NIGHT_RUNNING' && Number.isFinite(instant(this.state.deadline ?? '')) && instant(this.state.deadline!) > Date.now() && !this.frozen() }
   private taskAllowed(task: Task): boolean {
-    return task.state === 'queued' && task.approved === true && !!task.approveMessageId && !!task.ownerId
+    return task.state === 'queued' && task.approved === true && !!task.approveMessageId && !!task.ownerId && task.proposal?.requiresScopeConfirmation !== true
       && (task.access === 'read' || task.access === 'write') && task.repositories.length > 0
       && task.repositories.every(repository => Object.hasOwn(this.config.repositories, repository))
   }
@@ -144,10 +145,26 @@ class Controller implements NightController {
           return
         }
         if (command.type === 'status') {
-          const tasks = state.tasks.slice(-10).map(task => `${task.id} ${task.state} [${task.repositories.join(',')}/${task.access}/${task.approved ? '已批准' : '待批准'}/动作:${task.actions?.join(',') || '无'}] ${task.text.replace(/\s+/g, ' ').slice(0, 100)}`)
-          reply(`${state.mode}｜排队 ${state.tasks.filter(task => task.state === 'queued').length}｜运行 ${state.activeRunId ?? '无'}｜截止 ${state.deadline ?? '无'}\n${tasks.join('\n')}${state.problems.length ? `\n注意：${state.problems.join('；')}` : ''}`); return
+          const mine = state.tasks.filter(task => task.ownerId === input.actorId), page = command.page ?? 1
+          const pages = Math.max(1, Math.ceil(mine.length / 2)), start = (page - 1) * 2
+          if (!Number.isSafeInteger(page) || page < 1 || page > pages) { reply(`页码无效；状态共${pages}页。`); return }
+          const tasks = [...mine].reverse().slice(start, start + 2).map(task => `${task.id} ${task.state}/${task.proposal?.requiresScopeConfirmation ? '待确认范围' : task.approved ? '已批准' : '待批准'}`)
+          reply(`${state.mode}｜排队 ${state.tasks.filter(task => task.state === 'queued').length}｜运行 ${state.activeRunId ?? '无'}｜截止 ${state.deadline ?? '无'}\n${tasks.join('\n')}\n状态 ${page}/${pages}；查详情：任务详情 <ID>。${state.problems.length ? '\n存在待核查问题；当前状态不代表可安全接班。' : ''}`); return
         }
-        if (command.type === 'help') { reply(NIGHT_HELP); return }
+        if (command.type === 'help') { reply(command.topic ? NIGHT_HELP_TOPICS[command.topic] : NIGHT_HELP); return }
+        if (command.type === 'task-detail') {
+          const task = state.tasks.find(task => task.id === command.taskId && task.ownerId === input.actorId)
+          if (!task) { reply('拒绝：任务不存在或不属于本人。'); return }
+          const full = `任务 ${task.id}\n状态 ${task.state}｜${task.proposal?.requiresScopeConfirmation ? '待明确确认范围' : task.approved ? '已批准' : '未批准'}\n仓库 ${task.repositories.join(',')}｜权限 ${task.access}\n本地动作 ${task.actions?.join(',') || '无'}｜发布授权 ${task.releaseGrant ? '已记录，以完整授权范围和有效期为准' : '无'}\n原始任务：\n${task.text}${task.result ? `\n执行结果：${task.result.outcome}\n${task.result.summary}\n本地退出${task.result.writerStopped ? '已证' : '未证'}｜远端活动或未知${task.result.remoteActive ? '是' : '否'}` : ''}`
+          const part = replyPage(full, command.page ?? 1)
+          reply(`${part.text}\n任务详情 ${task.id} <页码>`); return
+        }
+        if (command.type === 'reply-detail') {
+          const stored = this.store.replyForOwner(command.replyId, input.actorId, input.target.chatId)
+          if (!stored) { reply('拒绝：回执不存在或不属于本人私聊。'); return }
+          const part = replyPage(stored.text, command.page ?? 1)
+          reply(`${part.text}\n回复详情 ${command.replyId} <页码>`); return
+        }
         if (command.type === 'pause' || command.type === 'handoff') {
           this.invalidateCheck(state)
           const mode = command.type === 'handoff' ? 'DAY_MANUAL' : 'NIGHT_PAUSED'
@@ -163,13 +180,26 @@ class Controller implements NightController {
           return
         }
         if (!this.config.enabled) { reply('夜间功能未启用，不接受任务授权或执行。'); return }
-        if (command.type === 'enqueue') {
-          if (!command.text.trim() || command.repositories.length === 0 || command.repositories.some(repository => !Object.hasOwn(this.config.repositories, repository)) || !['read', 'write'].includes(command.access)) {
+        if (command.type === 'enqueue' || command.type === 'propose') {
+          if (!command.text.trim() || command.text.length > 12000 || command.repositories.length === 0 || command.repositories.some(repository => !Object.hasOwn(this.config.repositories, repository)) || !['read', 'write'].includes(command.access)) {
             reply('拒绝：请提供任务内容、已配置的仓库别名和明确的 read/write 权限。'); return
           }
           const task: Task = { id: randomUUID(), originId: input.id, ownerId: input.actorId, text: command.text, repositories: [...new Set(command.repositories)], access: command.access, approved: false, target: input.target, state: 'queued', createdAt: iso() }
+          if (command.type === 'propose') task.proposal = { requiresScopeConfirmation: true, issueRefs: (command.issueRefs ?? []).slice(0, 20) }
           state.tasks.push(task)
-          reply(`已排队 ${task.id}｜${task.repositories.join(',')}｜${task.access}。需任务所有者明确批准；添加任务不会启动夜间执行。`)
+          if (task.proposal) reply(`已生成待确认任务 ${task.id}。\n建议范围：${task.repositories.join(',')}／${task.access === 'write' ? '修改' : '只读'}；跨域范围未自动扩展。\n原文已保存，可查任务详情 ${task.id}。\n请明确：确认任务 ${task.id} ${task.access === 'write' ? '修改' : '只读'} ${task.repositories.join(',')}\n未授权提交/发布，未启动。`)
+          else reply(`已排队 ${task.id}｜${task.repositories.join(',')}｜${task.access}。需任务所有者明确批准；添加任务不会启动夜间执行。`)
+        } else if (command.type === 'confirm-task') {
+          const task = state.tasks.find(task => task.id === command.taskId && task.ownerId === input.actorId)
+          if (!task || task.state !== 'queued' || task.proposal?.requiresScopeConfirmation !== true || state.mode === 'RECOVERY_REQUIRED'
+            || !['read', 'write'].includes(command.access) || command.repositories.length === 0 || command.repositories.some(repo => !Object.hasOwn(this.config.repositories, repo))) {
+            reply('拒绝：只有本人未启动的草案可确认；须提供准确白名单仓库及只读/修改权限。'); return
+          }
+          task.repositories = [...new Set(command.repositories)]; task.access = command.access
+          task.proposal.requiresScopeConfirmation = false; task.proposal.confirmedMessageId = input.id
+          // Confirm scope only. Approval remains a separate action so confirmation never starts work in a running shift.
+          task.approved = false; delete task.approveMessageId; delete task.actions; delete task.actionsApproveMessageId; delete task.releaseGrant
+          reply(`范围已确认 ${task.id}｜${task.repositories.join(',')}｜${task.access}。\n下一步：批准任务 ${task.id}。\n未授权提交/发布，未启动；如夜班已运行，批准后可能立即调度。`)
         } else if (command.type === 'authorize-release') {
           const task = state.tasks.find(item => item.id === command.taskId), policy = this.config.releasePolicy
           if (!task || task.ownerId !== input.actorId || task.state !== 'queued' || !task.approved || task.access !== 'write'
@@ -214,6 +244,7 @@ class Controller implements NightController {
           if (!task || task.ownerId !== input.actorId) { reply('拒绝：任务不存在，或发送者不是任务所有者。'); return }
           if (command.type === 'approve') {
             if (task.state !== 'queued' || state.mode === 'RECOVERY_REQUIRED') { reply('拒绝：只能在非恢复状态批准排队中的任务。'); return }
+            if (task.proposal?.requiresScopeConfirmation) { reply(`拒绝：请先确认准确范围：确认任务 ${task.id} 只读|修改 仓名。草案不视为执行授权。`); return }
             task.approved = true; task.approveMessageId = input.id
             reply(`已批准 ${task.id}｜仓库 ${task.repositories.join(',')}｜权限 ${task.access}。执行仍需有效的夜间时限授权。`)
           } else if (task.state === 'queued') {

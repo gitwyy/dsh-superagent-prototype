@@ -5,7 +5,9 @@ import type { Outbox } from '../app/outbox.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import type { NightConfig, NightController, Runner, Incoming } from './contracts.ts'
 import { createController } from './controller.ts'
-import { NIGHT_HELP, parseNightCommand } from './commands.ts'
+import { parseNightCommand } from './commands.ts'
+import { parseNightProposal } from './proposals.ts'
+import { boundedNightReply, replyPage } from './replies.ts'
 import type { ManagedRunner } from './release/managed-runner.ts'
 
 export interface NightAdapterHost {
@@ -66,10 +68,13 @@ export class NightAdapter {
     if (!chatId || !messageId) return 'filtered'
     const incoming: Incoming = { id: trigger.id, actorId: trigger.actor.id, text: trigger.text, at: trigger.at,
       direct: true, human: true, target: { source: 'feishu', chatId, messageId } }
-    if (trigger.text.trim() === '发布状态' && this.host.runner.operations) {
+    const releaseStatus = /^发布状态(?:\s+([1-9]\d{0,3}))?$/u.exec(trigger.text.trim())
+    if (releaseStatus && this.host.runner.operations) {
       const operations = this.host.runner.operations().filter(op => this.controller.snapshot().tasks.some(t => t.id === op.taskId && t.ownerId === incoming.actorId))
+      const text = operations.length ? [...operations].reverse().map(op => `${op.id} ${op.repository}/${op.action} ${op.state} ${op.sha.slice(0, 12)}\n${op.detail}`).join('\n') : '没有本人的远端发布记录；未执行远端动作。'
+      const page = replyPage(text, Number(releaseStatus[1] ?? 1))
       this.host.outbox.send({ id: key('release-status', trigger.id), channel: trigger.channel, kind: 'reply',
-        text: operations.length ? operations.slice(-10).map(op => `${op.id} ${op.repository}/${op.action} ${op.state} ${op.sha.slice(0, 12)}\n${op.detail}`).join('\n') : '没有本人的远端发布记录；未执行远端动作。' })
+        text: boundedNightReply(`${page.text}\n查看其他页：发布状态 <页码>。`) })
       return 'stored'
     }
     const reconcile = /^核查发布\s+([a-zA-Z0-9-]{1,100})$/u.exec(trigger.text.trim())
@@ -78,18 +83,22 @@ export class NightAdapter {
       if (!operation || !this.controller.snapshot().tasks.some(t => t.id === operation.taskId && t.ownerId === incoming.actorId)) return 'filtered'
       const result = await this.host.runner.reconcile(operation.id, AbortSignal.timeout(30000))
       this.host.outbox.send({ id: key('release-reconcile', trigger.id), channel: trigger.channel, kind: 'reply',
-        text: `${result.operationId ?? operation.id} ${result.status}\n${result.detail}\n远端活动或结果不明：${result.remoteActive ? '是' : '否'}。本操作只读核查，没有重新触发。` })
+        text: boundedNightReply(`${result.operationId ?? operation.id} ${result.status}\n${result.detail}\n远端活动或结果不明：${result.remoteActive ? '是' : '否'}。本操作只读核查，没有重新触发。`) })
       return 'stored'
     }
     let command
     try { command = parseNightCommand(trigger.text) }
-    catch (error) {
-      this.host.outbox.send({ id: key('night-invalid', trigger.id), channel: trigger.channel, kind: 'reply',
-        text: `${error instanceof Error ? error.message : '指令无效。'}\n\n${NIGHT_HELP}` })
-      return 'stored'
+    catch {
+      const proposal = parseNightProposal(trigger.text, Object.keys(this.host.config.repositories))
+      if (proposal) command = { type: 'propose' as const, ...proposal }
+      else {
+        this.host.outbox.send({ id: key('night-invalid', trigger.id), channel: trigger.channel, kind: 'reply',
+          text: '这条消息没有执行：指令格式或任务范围不明确。可说“处理 mate-manage-web#84”生成待确认任务，或用“入队 只读 仓名 | 任务说明”。查看：帮助／帮助 任务／帮助 发布。' })
+        return 'stored'
+      }
     }
     // Controls that stop work must remain usable when the ordinary application is paused.
-    if (denied && !['status', 'help', 'pause', 'handoff', 'cancel'].includes(command.type)) {
+    if (denied && !['status', 'help', 'task-detail', 'reply-detail', 'pause', 'handoff', 'cancel'].includes(command.type)) {
       this.host.outbox.send({ id: key('night-paused', trigger.id), channel: trigger.channel, kind: 'reply',
         text: '服务管理开关已暂停；未启动或批准任务。可发送“状态”或“我要接班”。' })
       return 'stored'
@@ -116,7 +125,7 @@ export class NightAdapter {
       })
       this.lastPause = paused
       for (const message of this.controller.pendingReplies()) {
-        this.host.outbox.send({ id: key('night-out', message.id), kind: 'reply', text: message.text.slice(0, 16000),
+        this.host.outbox.send({ id: key('night-out', message.id), kind: 'reply', text: boundedNightReply(message.text, `回复详情 ${message.id}`),
           channel: { source: 'feishu', thread: `feishu:${message.target.chatId}`,
             address: { chatId: message.target.chatId, messageId: message.target.messageId, direct: 'true' } } })
         // Superagent's Outbox durably owns retries once send() commits. Replay uses the same ID.

@@ -10,6 +10,10 @@ Runtime capability is enabled only by an explicit locally configured `releasePol
 
 ## Human authorization
 
+Natural-language requests such as `处理 mate-manage-web#84` create only inert task proposals. They do not authorize cross-repository changes, meeting sign-off, local actions, release or startup. The owner must explicitly confirm scope with `确认任务 <id> 只读|修改 <repo-list>`, then separately `批准任务 <id>`. Confirmation alone never starts a task, even during an active shift. Missing/ambiguous/foreign scope is rejected with a short reply.
+
+All nightshift IM replies respect the real Outbox100-word limit. Oversized receipts remain in durable storage; the message supplies a non-authoritative notice and an owner-only `回复详情 <receipt-id> [page]` command. `帮助 任务|发布|控制`, `状态 [page]`, `任务详情 <id> [page]`, and `发布状态 [page]` provide on-demand detail without automatically splitting messages.
+
 Normal task approval and local actions remain separate. A release grant binds task owner, approval message, policy digest, exact repository/source branch/target/base SHA, action list, environment and expiry. Source branches must be `agent/` or `sdd/`; targets cannot be pushed directly.
 
 Example structure (replace every placeholder, valid for at most 12 hours and never across the freeze):
