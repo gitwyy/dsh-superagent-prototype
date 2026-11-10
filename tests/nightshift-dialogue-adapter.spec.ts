@@ -39,22 +39,16 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 void sleep
 
 describe('natural-language private control through the real adapter', () => {
-  it('restates scope, then starts only after a second explicit confirmation', async () => {
+  it('restates scope once, then approves and runs without another confirmation', async () => {
     const f = fixture()
     await f.adapter.receive(f.event('处理 mate-manage-web open issue mate-manage-web#84，授权自动代处理各域接线和会签。'))
     expect(f.last()).toContain('mate-manage-web')
     expect(f.last()).toContain('确认这个范围吗')
     expect(f.adapter.snapshot().tasks[0]!.proposal?.requiresScopeConfirmation).toBe(true)
     await f.adapter.receive(f.event('确认'))
-    expect(f.adapter.snapshot().tasks[0]!.proposal?.requiresScopeConfirmation).toBe(false)
-    expect(f.adapter.snapshot().tasks[0]!.approved).toBe(false)
-    expect(f.runner.run).not.toHaveBeenCalled()
-    await f.adapter.receive(f.event('开始，截止1小时后'))
-    expect(f.last()).toContain('将批准并启动')
-    expect(f.last()).toContain('截止 2026-')
-    await f.adapter.receive(f.event('确认'))
     await vi.waitFor(() => expect(f.adapter.snapshot().mode).toBe('NIGHT_RUNNING'), { timeout: 5000 })
-    vi.waitFor(() => expect(f.runner.run).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(f.runner.run).toHaveBeenCalledTimes(1), { timeout: 5000 })
+    expect(f.adapter.snapshot().tasks[0]!.approved).toBe(true)
     f.bounded()
   })
   it('cancels the staged draft when the owner declines, and cannot be confirmed by anyone else', async () => {

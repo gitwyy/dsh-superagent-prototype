@@ -1,6 +1,7 @@
 /** Real durable Outbox length enforcement plus private adapter/controller; no network or business execution. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { NightAdapter } from '../src/nightshift/adapter.ts'
@@ -17,6 +18,11 @@ afterEach(async () => { for (const f of resources.splice(0)) { await f.adapter.c
 let sequence = 0
 function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'night-im-boundary-'))), workspace = join(root, 'workspace'); mkdirSync(workspace)
+  const gitEnv = { PATH: '/usr/bin:/bin', HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }
+  execFileSync('/usr/bin/git', ['init', '-q', '-b', 'main'], { cwd: workspace, env: gitEnv })
+  writeFileSync(join(workspace, 'README.md'), 'fixture\n')
+  execFileSync('/usr/bin/git', ['add', 'README.md'], { cwd: workspace, env: gitEnv })
+  execFileSync('/usr/bin/git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline'], { cwd: workspace, env: gitEnv })
   const config: NightConfig = { enabled: true, workspace, stateDir: join(root, 'state'), piHome: root, piExecutable: process.execPath, sessionFile: join(root, 'session'), lockRoot: join(root, 'locks'), repositories: { 'mate-manage-web': workspace, 'mate-account': workspace, 'mate-workspace': workspace }, maxTaskSeconds: 120, freezeWindows: [] }
   const settings = SettingsSchema.parse({ sources: { feishu: { enabled: true, config: { directMessages: true, chats: [], otherChats: 'none' } } }, policy: { sources: { feishu: { allowed: [{ id: 'owner' }, { id: 'other' }] } } } })
   const store = new Store(join(root, 'host.sqlite'))
@@ -40,14 +46,17 @@ describe('nightshift real IM Outbox boundary', () => {
     expect(tasks[0]!.actions).toBeUndefined(); expect(tasks[0]!.releaseGrant).toBeUndefined()
     expect(f.receipt().text).toContain('确认这个范围吗'); expect(f.send).toHaveBeenCalledOnce(); expect(f.runner.run).not.toHaveBeenCalled(); f.check()
   })
-  it('requires owner-confirmed exact scope followed by separate approval; neither can grant publish or start', async () => {
+  it('confirms scope once, then approves and runs; another actor and unconfirmed approval never start it', async () => {
     const f = fixture(); await f.adapter.receive(f.event(original)); const id = f.adapter.snapshot().tasks[0]!.id
     await f.adapter.receive(f.event(`批准任务 ${id}`)); expect(f.adapter.snapshot().tasks[0]!.approved).toBe(false)
-    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-manage-web`, undefined, 'other')); expect(f.adapter.snapshot().tasks[0]!.proposal!.requiresScopeConfirmation).toBe(true)
-    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-one-platform`)); expect(f.adapter.snapshot().tasks[0]!.proposal!.requiresScopeConfirmation).toBe(true)
-    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-manage-web,mate-account`)); expect(f.adapter.snapshot().tasks[0]).toMatchObject({ repositories: ['mate-manage-web', 'mate-account'], approved: false, proposal: { requiresScopeConfirmation: false } })
-    await f.adapter.receive(f.event(`批准任务 ${id}`)); expect(f.adapter.snapshot().tasks[0]!.approved).toBe(true)
-    expect(f.adapter.snapshot().mode).toBe('DAY_MANUAL'); expect(f.runner.run).not.toHaveBeenCalled(); expect(f.adapter.snapshot().tasks[0]!.releaseGrant).toBeUndefined(); f.check()
+    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-manage-web`, undefined, 'other'))
+    expect(f.adapter.snapshot().tasks[0]!.proposal!.requiresScopeConfirmation).toBe(true)
+    expect(f.runner.run).not.toHaveBeenCalled()
+    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-manage-web,mate-account`))
+    await vi.waitFor(() => expect(f.adapter.snapshot().mode).toBe('NIGHT_RUNNING'), { timeout: 5000 })
+    expect(f.adapter.snapshot().tasks[0]).toMatchObject({ repositories: ['mate-manage-web', 'mate-account'], approved: true, proposal: { requiresScopeConfirmation: false } })
+    expect(f.adapter.snapshot().tasks[0]!.releaseGrant).toBeUndefined()
+    expect(f.runner.run).toHaveBeenCalledTimes(1); f.check()
   })
   it('rejects malformed controls with one short receipt rather than a 214-word help crash', async () => {
     const f = fixture()
@@ -79,10 +88,14 @@ describe('nightshift real IM Outbox boundary', () => {
     await f.adapter.receive(f.event(`回复详情 ${replyId} 1`, undefined, 'other')); expect(f.receipt().text).toContain('不属于本人')
     f.check()
   })
-  it('does not let proposal scope confirmation start work even when a shift is already running', async () => {
-    const f = fixture(); await f.adapter.receive(f.event('开始夜班 截止 '+new Date(Date.now()+60000).toISOString().replace(/\.\d{3}Z$/, 'Z'))); await vi.waitFor(() => expect(f.adapter.snapshot().mode).toBe('NIGHT_RUNNING'))
+  it('confirms and queues a second task while a shift is already running, without a second writer', async () => {
+    const f = fixture(); await f.adapter.receive(f.event('开始夜班 截止 ' + new Date(Date.now() + 60000).toISOString().replace(/\.\d{3}Z$/, 'Z')))
+    await vi.waitFor(() => expect(f.adapter.snapshot().mode).toBe('NIGHT_RUNNING'))
     await f.adapter.receive(f.event(original)); const id = f.adapter.snapshot().tasks[0]!.id
-    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-manage-web`)); expect(f.runner.run).not.toHaveBeenCalled(); expect(f.adapter.snapshot().tasks[0]!.approved).toBe(false); f.check()
+    await f.adapter.receive(f.event(`确认任务 ${id} 修改 mate-manage-web`))
+    await vi.waitFor(() => expect(f.adapter.snapshot().tasks[0]!.approved).toBe(true))
+    // No second writer is spawned while the shift already runs; the task waits for its turn.
+    expect(f.runner.run).not.toHaveBeenCalled(); f.check()
   })
   it('parses explicit detail/confirmation commands without treating them as task prose', () => {
     expect(parseNightCommand('帮助 发布')).toEqual({ type: 'help', topic: 'release' })

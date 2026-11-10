@@ -223,10 +223,7 @@ class Controller implements NightController {
             reply('拒绝：只有本人未启动的草案可确认；须提供准确白名单仓库及只读/修改权限。'); return
           }
           task.repositories = [...new Set(command.repositories)]; task.access = command.access
-          task.proposal.requiresScopeConfirmation = false; task.proposal.confirmedMessageId = input.id
-          // Confirm scope only. Approval remains a separate action so confirmation never starts work in a running shift.
-          task.approved = false; delete task.approveMessageId; delete task.actions; delete task.actionsApproveMessageId; delete task.releaseGrant
-          reply(`范围已确认 ${task.id}｜${task.repositories.join(',')}｜${task.access}。\n下一步：批准任务 ${task.id}。\n未授权提交/发布，未启动；如夜班已运行，批准后可能立即调度。`)
+          check = this.confirmScope(state, task, input, reply)
         } else if (command.type === 'authorize-release') {
           const task = state.tasks.find(item => item.id === command.taskId), policy = this.config.releasePolicy
           if (!task || task.ownerId !== input.actorId || task.state !== 'queued' || !task.approved || task.access !== 'write'
@@ -312,6 +309,32 @@ class Controller implements NightController {
     const approved = mine.filter(task => task.approved)
     return approved.length === 1 ? approved[0] : mine.length === 1 ? mine[0] : undefined
   }
+  /** Mode C: one explicit scope confirmation approves the task and starts a bounded window.
+   * Release (merge/deploy) still needs its own grant; production and unknown effects stay closed. */
+  private confirmScope(state: DurableState, task: Task, input: Incoming, reply: (text: string) => void): PendingCheck | undefined {
+    task.proposal!.requiresScopeConfirmation = false
+    task.proposal!.confirmedMessageId = input.id
+    delete task.actions; delete task.actionsApproveMessageId; delete task.releaseGrant
+    task.approved = true; task.approveMessageId = input.id
+    const scope = `${task.repositories.join(',')}（${task.access === 'read' ? '只读' : '修改'}）`
+    if (state.mode === 'RECOVERY_REQUIRED') { reply(`范围已确认并批准：${scope}。\n当前是恢复态，暂不执行；说“可以恢复”后我会继续。`); return }
+    if (state.mode === 'NIGHT_RUNNING' && this.grantValid()) { reply(`范围已确认并批准：${scope}。\n夜班已在运行，将在当前截止时间内执行。`); return }
+    if (this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING') {
+      reply(`范围已确认并批准：${scope}。\n当前有任务在跑，完成后自动执行。`); return
+    }
+    if (!state.writerStopped) { reply(`范围已确认并批准：${scope}。\n写入进程状态未确认，需先人工恢复后再执行。`); return }
+    const now = Date.now()
+    if (this.frozen(now)) { reply(`范围已确认并批准：${scope}。\n当前处于冻结窗口，结束后说“开始”即可执行。`); return }
+    const window = 2 * 60 * 60 * 1000
+    const nextFreeze = this.windows.filter(item => item.from > now).map(item => item.from).sort((a, b) => a - b)[0]
+    const until = Math.min(now + window, nextFreeze ?? now + window)
+    if (until <= now) { reply(`范围已确认并批准：${scope}。\n没有可用的执行窗口，稍后说“开始”。`); return }
+    const check: PendingCheck = { id: input.id, target: input.target, kind: 'start', deadline: new Date(until).toISOString(), taskIds: [task.id] }
+    try { this.store.acquireWorkspace() } catch (error) { reply(`范围已确认并批准：${scope}。\n工作区锁不可用：${errorText(error)}`); return }
+    state.pendingCheck = check
+    reply(`范围已确认并批准：${scope}。\n预检中，通过后立即执行；默认截止 ${new Date(until).toISOString()}。\n合并/部署仍需单独确认。`)
+    return check
+  }
   private proposeAction(state: DurableState, request: PendingActionInput, input: Incoming, reply: (text: string) => void): void {
     if (!request || typeof request !== 'object') { reply('这条消息没有执行：目标不清楚。'); return }
     const now = Date.now()
@@ -330,7 +353,7 @@ class Controller implements NightController {
       if (existing) { existing.text = text; existing.repositories = repositories; existing.access = access }
       const task = existing ?? this.createProposal(state, text, repositories, access, request.issueRefs, input)
       this.stage(state, input, { kind: 'task-scope', taskId: task.id }, repositories.join(','))
-      reply(`将登记一个待执行任务：\n范围 ${repositories.join(',')}（${access === 'read' ? '只读' : '修改'}）。\n不含提交、推送、合并、部署，也不会自动执行。\n确认这个范围吗？回复“确认”，或“算了”。`)
+      reply(`将登记任务：\n范围 ${repositories.join(',')}（${access === 'read' ? '只读' : '修改'}）。\n确认后立即批准并执行（默认 2 小时窗口）；合并/部署仍需单独确认；不会自动扩到其他仓库。\n确认这个范围吗？回复“确认”，或“算了”。`)
       return
     }
     if (request.kind === 'start') {
@@ -375,12 +398,9 @@ class Controller implements NightController {
     if (request.kind === 'task-scope') {
       const task = state.tasks.find(item => item.id === request.taskId && item.ownerId === input.actorId)
       if (!task || task.state !== 'queued' || task.proposal?.requiresScopeConfirmation !== true) { reply('任务状态已变化，未执行。'); return }
-      task.proposal.requiresScopeConfirmation = false
-      task.proposal.confirmedMessageId = input.id
-      task.approved = false; delete task.approveMessageId; delete task.actions; delete task.actionsApproveMessageId; delete task.releaseGrant
-      reply(`范围已确认：${task.repositories.join(',')}（${task.access === 'read' ? '只读' : '修改'}）。\n还没有开始。说“开始，截止今晚八点”这样的时间，我复述后再确认。`)
-      return
+      return this.confirmScope(state, task, input, reply)
     }
+
     if (request.kind === 'start') {
       const deadlineMs = typeof request.deadline === 'string' ? instant(request.deadline) : NaN
       const now = Date.now()

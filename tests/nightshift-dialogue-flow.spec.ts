@@ -47,7 +47,7 @@ afterEach(async () => {
 })
 
 describe('natural-language staging requires one explicit confirmation', () => {
-  it('stages a task proposal, restates its exact boundary, and confirms only the scope', async () => {
+  it('turns one scope confirmation into approval plus a bounded run', async () => {
     const h = harness()
     await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write' } })
     const task = h.controller.snapshot().tasks[0]!
@@ -56,9 +56,11 @@ describe('natural-language staging requires one explicit confirmation', () => {
     expect(texts(h.controller)).toContain('范围 mate-manage-web')
     expect(texts(h.controller)).toContain('确认这个范围吗')
     await command(h.controller, { type: 'confirm-action' })
+    await drain()
     expect(h.controller.snapshot().tasks[0]!.proposal?.requiresScopeConfirmation).toBe(false)
-    expect(h.controller.snapshot().tasks[0]!.approved).toBe(false)
-    expect(h.calls).toHaveLength(0)
+    expect(h.controller.snapshot().tasks[0]!.approved).toBe(true)
+    expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
+    expect(h.calls).toHaveLength(1)
   })
   it('never starts from prose alone and rejects confirmation without a staged action', async () => {
     const h = harness()
@@ -90,50 +92,34 @@ describe('natural-language staging requires one explicit confirmation', () => {
     expect(h.calls).toHaveLength(0)
     expect(texts(h.controller)).toContain('已取消')
   })
-  it('starts only after scope confirmation and a second confirmation, with approval deferred until preflight passes', async () => {
-    const h = harness()
-    await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write' } })
-    await command(h.controller, { type: 'confirm-action' })
-    await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline() } })
-    expect(texts(h.controller)).toContain('将批准并启动 1 个任务')
-    expect(h.controller.snapshot().tasks[0]!.approved).toBe(false)
-    await command(h.controller, { type: 'confirm-action' })
-    await drain()
-    expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
-    expect(h.controller.snapshot().tasks[0]!.approved).toBe(true)
-    expect(h.calls).toHaveLength(1)
-  })
-  it('does not approve a task when preflight fails', async () => {
+  it('does not run when preflight fails, and keeps the task approved but not started', async () => {
     const h = harness()
     vi.mocked(h.runner.preflight).mockResolvedValue({ ok: false, problems: ['repo dirty'] })
     await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write' } })
     await command(h.controller, { type: 'confirm-action' })
-    await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline() } })
-    await command(h.controller, { type: 'confirm-action' })
     await drain()
     expect(h.controller.snapshot().mode).not.toBe('NIGHT_RUNNING')
-    expect(h.controller.snapshot().tasks[0]!.approved).toBe(false)
+    expect(h.controller.snapshot().tasks[0]!.approved).toBe(true)
     expect(h.calls).toHaveLength(0)
   })
-  it('rejects deadlines beyond 12 hours or inside a freeze window, and rejects starting while running', async () => {
-    const h = harness({ freezeWindows: [{ from: new Date(Date.now() + 1800_000).toISOString(), until: new Date(Date.now() + 7200_000).toISOString() }] })
+  it('refuses to auto-start inside a freeze window and rejects overlong explicit deadlines', async () => {
+    const h = harness({ freezeWindows: [{ from: new Date(Date.now() - 60_000).toISOString(), until: new Date(Date.now() + 3600_000).toISOString() }] })
     await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write' } })
     await command(h.controller, { type: 'confirm-action' })
+    await drain()
+    expect(texts(h.controller)).toContain('冻结窗口')
+    expect(h.controller.snapshot().mode).not.toBe('NIGHT_RUNNING')
+    expect(h.calls).toHaveLength(0)
     await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline(13) } })
     expect(texts(h.controller)).toContain('12小时内')
-    await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline() } })
-    expect(texts(h.controller)).toContain('冻结')
   })
-  it('grants local commit only after approval, by staged confirmation, and never publish', async () => {
+  it('grants local commit after the scope confirmation, and never publish', async () => {
     const policy = { validations: { check: { executable: '/bin/true', executableSha256: 'a'.repeat(64), args: [], timeoutSeconds: 1, pinnedFiles: {} } },
       requiredValidations: ['check'], author: { name: 'Agent', email: 'agent@example.invalid' }, targetBranch: 'master' }
     const h = harness({ repositoryActions: { 'mate-manage-web': policy } })
     await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write' } })
     await command(h.controller, { type: 'confirm-action' })
-    await command(h.controller, { type: 'propose-action', action: { kind: 'allow-commit' } })
-    expect(texts(h.controller)).toContain('还没有批准')
-    await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline() } })
-    await command(h.controller, { type: 'confirm-action' })
+    await drain()
     await command(h.controller, { type: 'propose-action', action: { kind: 'allow-commit' } })
     expect(texts(h.controller)).toContain('本地验证和提交')
     await command(h.controller, { type: 'confirm-action' })
@@ -146,26 +132,17 @@ describe('natural-language staging requires one explicit confirmation', () => {
     expect(h.controller.snapshot().mode).toBe('DAY_MANUAL')
   })
 
-  it('approves a newly confirmed task while the shift is already running, without demanding a new start', async () => {
+  it('approves a newly confirmed task while the shift is already running, without a second start', async () => {
     const h = harness()
     await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: 'first', repositories: ['mate-manage-web'], access: 'write' } })
     await command(h.controller, { type: 'confirm-action' })
-    await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline() } })
-    await command(h.controller, { type: 'confirm-action' })
     await drain()
     expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
-    // A second task, confirmed scope, while the first is still running.
     await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: 'second', repositories: ['mate-account'], access: 'write' } })
-    await command(h.controller, { type: 'confirm-action' })
-    const second = h.controller.snapshot().tasks[1]!
-    expect(second.approved).toBe(false)
-    await command(h.controller, { type: 'propose-action', action: { kind: 'start' } })
-    expect(texts(h.controller)).toContain('夜班已在运行')
     await command(h.controller, { type: 'confirm-action' })
     await drain()
     expect(h.controller.snapshot().tasks[1]!.approved).toBe(true)
     expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
-    // The running task was never restarted or duplicated.
     expect(h.calls).toHaveLength(1)
   })
 
