@@ -3,7 +3,7 @@ import { key, type ReceiveResult, type Trigger } from '../core/index.ts'
 import { allowedSender, type Settings } from '../policy.ts'
 import type { Outbox } from '../app/outbox.ts'
 import type { HealthEntry } from '../infra/health.ts'
-import type { Command, NightConfig, NightController, Runner, Incoming } from './contracts.ts'
+import type { Command, NightConfig, NightController, PendingActionInput, Runner, Incoming } from './contracts.ts'
 import { createController } from './controller.ts'
 import { parseNightCommand } from './commands.ts'
 import { parseNightProposal } from './proposals.ts'
@@ -98,8 +98,9 @@ export class NightAdapter {
           access: task.access, text: task.text, scopePending: task.proposal?.requiresScopeConfirmation === true })),
       })
       if (intent) command = dialogueCommand(intent, snapshot.tasks)
-      // Attach the exact issue's requirement text from the host, so the worker does not need network access.
-      if (intent?.kind === 'task' && intent.issueRefs?.length && command?.type === 'propose-action' && command.action.kind === 'task-proposal') {
+      // Any issue reference refreshes the task content first, even when the request otherwise means
+      // "continue that task": otherwise the worker would run against a text without the requirement.
+      if (intent?.kind === 'task' && intent.issueRefs?.length && command?.type === 'propose-action') {
         const blocks: string[] = []
         for (const ref of intent.issueRefs.slice(0, 2)) {
           const [alias, number] = ref.split('#')
@@ -109,8 +110,12 @@ export class NightAdapter {
           const context = await readIssueContext(repository, issue, AbortSignal.timeout(8_000))
           if (context) blocks.push(context)
         }
-        if (blocks.length) command = { ...command, action: { ...command.action,
-          text: `${command.action.text ?? trigger.text}\n\n[Host 只读注入的 Issue 上下文]\n${blocks.join('\n\n')}`.slice(0, 12_000) } }
+        if (blocks.length) {
+          const action: PendingActionInput = { kind: 'task-proposal',
+            text: `${intent.text}\n\n[Host 只读注入的 Issue 上下文]\n${blocks.join('\n\n')}`.slice(0, 12_000),
+            repositories: intent.repositories, access: intent.access, issueRefs: intent.issueRefs }
+          command = { type: 'propose-action' as const, action }
+        }
       }
       const proposal = command ? undefined : parseNightProposal(trigger.text, Object.keys(this.host.config.repositories))
       if (proposal) command = { type: 'propose' as const, ...proposal }
