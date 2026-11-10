@@ -181,7 +181,7 @@ class Controller implements NightController {
         }
         if (!this.config.enabled) { reply('夜间功能未启用，不接受任务授权或执行。'); return }
         if (command.type === 'propose-action') {
-          this.proposeAction(state, command.action, input, reply)
+          check = this.proposeAction(state, command.action, input, reply)
           return
         }
         if (command.type === 'confirm-action') {
@@ -335,7 +335,7 @@ class Controller implements NightController {
     reply(`范围已确认并批准：${scope}。\n预检中，通过后立即执行；默认截止 ${new Date(until).toISOString()}。\n合并/部署仍需单独确认。`)
     return check
   }
-  private proposeAction(state: DurableState, request: PendingActionInput, input: Incoming, reply: (text: string) => void): void {
+  private proposeAction(state: DurableState, request: PendingActionInput, input: Incoming, reply: (text: string) => void): PendingCheck | undefined {
     if (!request || typeof request !== 'object') { reply('这条消息没有执行：目标不清楚。'); return }
     const now = Date.now()
     if (request.kind === 'task-proposal') {
@@ -352,6 +352,8 @@ class Controller implements NightController {
       // Reuse the same draft, but refresh its text: a later attempt may carry host-injected issue context.
       if (existing) { existing.text = text; existing.repositories = repositories; existing.access = access }
       const task = existing ?? this.createProposal(state, text, repositories, access, request.issueRefs, input)
+      // Full engine: a plain-language request runs directly; release (merge/deploy) still needs its own grant.
+      if ((this.config.engineMode ?? 'guarded') === 'full') return this.confirmScope(state, task, input, reply)
       this.stage(state, input, { kind: 'task-scope', taskId: task.id }, repositories.join(','))
       reply(`将登记任务：\n范围 ${repositories.join(',')}（${access === 'read' ? '只读' : '修改'}）。\n确认后立即批准并执行（默认 2 小时窗口）；合并/部署仍需单独确认；不会自动扩到其他仓库。\n确认这个范围吗？回复“确认”，或“算了”。`)
       return

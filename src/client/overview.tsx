@@ -80,8 +80,8 @@ export function OverviewPage() {
         <p>{t('nightshiftDeadline')}: {night.deadline ?? '—'}</p>
         {night.problems.map((problem, index) => <p key={index} className="dt-error">{problem}</p>)}
       </Section>
-      <Section title={t('nightshiftTasks')} count={night.tasks.length}>
-        <ul className="dt-list">{night.tasks.slice(-30).reverse().map(task => <li className="dt-row" key={task.id}>
+      <Section title={night.tasks.some(task => task.state === 'running') ? `${t('nightshiftTasks')} · ${t('executingLabel')}` : t('nightshiftTasks')} count={night.tasks.length}>
+        <ul className="dt-list">{[...night.tasks].sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running')).slice(-30).reverse().map(task => <li className="dt-row" key={task.id}>
           <div className="dt-row-main"><strong>{task.text.slice(0, 160)}</strong>
             <p className="dt-mono">{task.id}</p>
             <p>{task.state} · {task.access} · {task.repositories.join(', ')} · {task.approved ? t('nightshiftApproved') : t('nightshiftUnapproved')}</p>

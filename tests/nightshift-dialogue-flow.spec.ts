@@ -155,4 +155,13 @@ describe('natural-language staging requires one explicit confirmation', () => {
     expect(tasks[0]!.text).toContain('详细需求')
     expect(tasks[0]!.proposal?.requiresScopeConfirmation).toBe(true)
   })
+
+  it('runs a plain-language task immediately in full engine mode, with no confirmation step', async () => {
+    const h = harness({ engineMode: 'full' })
+    await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write' } })
+    await drain()
+    expect(h.controller.snapshot().tasks[0]!.approved).toBe(true)
+    expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
+    expect(h.calls).toHaveLength(1)
+  })
 })
