@@ -44,8 +44,9 @@ describe('Pi startup diagnostics', () => {
 
   it('launches a Node-shebang Pi with the current Node binary instead of trusting PATH', async () => {
     const f = fixture('#!/usr/bin/env node\nprocess.exit(0)\n')
-    expect(await piCommand(f.executable)).toEqual({ command: process.execPath, prefix: [f.executable] })
+    expect(await piCommand(f.executable, false)).toEqual({ command: process.execPath, prefix: [f.executable], env: {} })
+    expect(await piCommand(f.executable, true)).toMatchObject({ command: process.execPath, env: { ELECTRON_RUN_AS_NODE: '1' } })
     const shell = fixture('#!/bin/sh\nexit 1\n')
-    expect(await piCommand(shell.executable)).toEqual({ command: shell.executable, prefix: [] })
+    expect(await piCommand(shell.executable, true)).toEqual({ command: shell.executable, prefix: [], env: {} })
   })
 })
