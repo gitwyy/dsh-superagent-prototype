@@ -1,4 +1,4 @@
-# Task-preauthorized GitLab release capability (under construction)
+# Task-preauthorized GitLab release capability
 
 ## Authorized scope
 
@@ -6,7 +6,7 @@ The operator approved the existing 17 Mate v2 aliases, task-level preauthorizati
 
 **Deployment already exists:** merging master triggers the existing Jenkins webhook builds. `deploy` here means adopting/observing those exact builds. It does not POST a second Jenkins build, automatically retry, cancel unrelated jobs, or invent a new delivery pipeline.
 
-Current milestone is source implementation + isolated tests + GitLab identity/settings preparation. Release policy is **not enabled in the live nightshift service** until Jenkins identity/route/write-window evidence and full integration are verified. A token or project setting alone is not runtime permission.
+Runtime capability is enabled only by an explicit locally configured `releasePolicy` and current operator attestation, after identity/route/write-window integration has been verified. A token or project setting alone is not runtime permission. Current deployment supports the existing **test** routes; preprod has no verified destination and remains unavailable. Production is always outside this policy.
 
 ## Human authorization
 
@@ -46,7 +46,13 @@ These are cooperative process/tool boundaries, **not an OS sandbox**. Same-user 
 
 The standalone Python gate validates a canonical HMAC-signed capability for one exact job/source/project/non-production destination and a short window. It writes durable exclusive nonce and operation/job intent markers before granting admission. Unknown/reused markers fail closed. It must execute at the existing worker's actual deployment-write boundary, not only at build start. Signed capabilities expire at the minimum task/shift/freeze boundary.
 
-The gate cannot cancel an already-admitted patch, prove deploy completion, or learn later revocation while offline. Integrating trusted bot actor propagation, grant retrieval, deployment-only secret mounts, restricted observer credentials and publisher hashes remains mandatory before activation. Unrelated human pipelines must remain unchanged. No new build is triggered during onboarding.
+The gate cannot cancel an already-admitted patch, prove deploy completion, or learn later revocation while offline. Trusted bot actor propagation, grant retrieval, deployment-only secret mounts, restricted observer credentials and publisher hashes are required for activation. Unrelated human pipelines retain their existing route. No new build is triggered during onboarding.
+
+Current publisher configuration is verified at onboarding and represented by a **short-lived operator attestation** (initially24h). Runtime compares that local record and expiry to policy; it does not continuously GET administrator-only Jenkins config.xml. An administrator change requires re-review/renewal; expired evidence blocks releases instead of granting indefinite permission.
+
+Local `source` validation is a pinned, non-executing syntax/whitespace/conflict check. It explicitly does not compile or run unit tests. Required full validation remains the exact-source-SHA successful GitLab MR pipeline. Existing protected tracked files may participate in host-private digesting but cannot be modified/published through the ordinary guard.
+
+Preauthorized release branches are created only at the exact admitted base SHA. Missing local objects or an existing conflicting branch stop the task without reset/rebase. The operator must synchronize that base safely; source branches never silently start from a stale feature checkout.
 
 ## Provisioning and rollback
 
@@ -54,6 +60,6 @@ The gate cannot cancel an already-admitted patch, prove deploy completion, or le
 
 The current 17 project tokens are Maintainer(40), scopes `api` and `write_repository`, expiring 2026-12-10. Those are project-scoped, not group/instance administrator grants. Runtime policy still denies direct protected-target push and out-of-scope actions regardless of token capability.
 
-Rollback after checking no active/unknown release effects: disable release policy; revoke only these recorded project-token IDs if desired; restore only each recorded prior merge_method after verifying it has not changed since provisioning. Do not rotate/revoke unrelated identities or weaken branch protections. Jenkins changes require their own exact backup/hash-checked rollback and are not yet applied by this milestone.
+Rollback after checking no active/unknown release effects: disable release policy; revoke only these recorded project-token IDs if desired; restore only each recorded prior merge_method after verifying it has not changed since provisioning. Do not rotate/revoke unrelated identities or weaken branch protections. Jenkins changes have their own exact backup/hash-checked rollback. `rollback-jenkins-nightshift.py` plans a targeted restoration of this operation's20 job parser/extraction and4 Managed changes; default dry-run refuses drift. Observer ACL rollback uses the frozen `observer-rollback.groovy` operation receipt. Never remove gate assets while configured publishers still require them.
 
 API references: [GitLab project access tokens](https://docs.gitlab.com/api/project_access_tokens/), [projects](https://docs.gitlab.com/api/projects/), [merge requests](https://docs.gitlab.com/api/merge_requests/). Server API version/edition differences fail closed rather than bypassing approval evidence.

@@ -170,6 +170,18 @@ describe('explicit scoped action broker', { timeout: 30_000 }, () => {
     const other = fixture(); other.policy.repositoryActions = {} as typeof other.policy.repositoryActions
     expect((await createActions(other.policy, other.guard).execute({ action: 'validate', repository: 'app', recipe: 'check' })).outcome).toBe('blocked')
   })
+  it('hashes unchanged tracked protected configuration privately but denies changing it', async () => {
+    const f = fixture()
+    writeFileSync(resolve(f.repo, '.env.example'), 'EXAMPLE=fixture-only\n')
+    f.git(['add', '.env.example']); f.git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@invalid', 'commit', '-qm', 'tracked fixture config'])
+    f.policy.baseline.app!.head = f.git(['rev-parse', 'HEAD']).trim()
+    const broker = createActions(f.policy, f.guard)
+    writeFileSync(resolve(f.repo, 'source.txt'), 'ordinary change\n')
+    const out = await broker.execute({ action: 'validate', repository: 'app', recipe: 'check' })
+    expect(out.outcome).toBe('succeeded'); expect(JSON.stringify(out)).not.toContain('EXAMPLE=')
+    writeFileSync(resolve(f.repo, '.env.example'), 'EXAMPLE=changed\n')
+    expect((await broker.execute({ action: 'validate', repository: 'app', recipe: 'check' })).outcome).toBe('blocked')
+  })
   it('rejects unsafe untracked files and symlinks rather than silently excluding them', async () => {
     const f = fixture(); const broker = createActions(f.policy, f.guard)
     writeFileSync(resolve(f.repo, '.env'), 'DO_NOT_PUBLISH')

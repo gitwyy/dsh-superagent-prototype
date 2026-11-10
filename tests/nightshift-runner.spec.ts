@@ -200,6 +200,98 @@ describe('supervised fake Pi (never actual Pi)', { timeout: 40_000 }, () => {
   })
 })
 
+describe('preauthorized release branch preparation (disposable repositories only)', { timeout: 40_000 }, () => {
+  function grant(f: ReturnType<typeof fixture>, baseSha: string, sourceBranch = 'sdd/granted') {
+    f.task.access = 'write'; f.task.approved = true
+    f.task.releaseGrant = { id: 'release-grant', taskId: f.task.id, ownerId: f.task.ownerId, approvalMessageId: 'release-approval', issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), policyDigest: 'a'.repeat(64), scopes: [{ repository: 'app', sourceBranch, targetBranch: 'master', baseSha, actions: ['push', 'create_mr'] }] }
+  }
+  function newerHumanBranch(f: ReturnType<typeof fixture>) {
+    const base = f.git(['rev-parse', 'HEAD']).trim()
+    f.git(['switch', '-q', '-c', 'human/current'])
+    writeFileSync(resolve(f.repo, 'hello.txt'), 'newer human content\n')
+    f.git(['add', '--', 'hello.txt'])
+    const tree = f.git(['write-tree']).trim()
+    const head = f.git(['commit-tree', tree, '-p', base, '-m', 'disposable newer human snapshot']).trim()
+    f.git(['update-ref', 'refs/heads/human/current', head, base])
+    expect(f.git(['status', '--porcelain'])).toBe('')
+    return { base, head }
+  }
+  function didNotSpawn(f: ReturnType<typeof fixture>) {
+    expect(existsSync(f.config.sessionFile + '.launch')).toBe(false)
+    expect(existsSync(resolve(f.state, 'pi-runner.lock'))).toBe(false)
+  }
+  it('creates a fresh source branch at the exact older base, not the current human tip', async () => {
+    const f = fixture(); const { base, head } = newerHumanBranch(f)
+    grant(f, base)
+    const hook = resolve(f.repo, '.git/hooks/post-checkout')
+    writeFileSync(hook, `#!/bin/sh\ntouch '${f.root}/BRANCH_HOOK_RAN'\n`); chmodSync(hook, 0o700)
+    const out = await f.runner.run(f.request, new AbortController().signal)
+    expect(out.outcome).toBe('succeeded'); expect(out.writerStopped).toBe(true)
+    expect(f.git(['branch', '--show-current']).trim()).toBe('sdd/granted')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(base)
+    expect(f.git(['rev-parse', 'human/current']).trim()).toBe(head)
+    expect(f.git(['show', 'human/current:hello.txt'])).toBe('newer human content\n')
+    expect(readFileSync(resolve(f.repo, 'hello.txt'), 'utf8')).toBe('hello\n')
+    expect(f.git(['status', '--porcelain'])).toBe('')
+    expect(existsSync(f.root + '/BRANCH_HOOK_RAN')).toBe(false)
+    expect(existsSync(f.config.sessionFile + '.launch')).toBe(true)
+  })
+  it('blocks a missing immutable base before spawning or creating the source branch', async () => {
+    const f = fixture(); const before = f.git(['rev-parse', 'HEAD']).trim()
+    grant(f, 'f'.repeat(40))
+    const out = await f.runner.run(f.request, new AbortController().signal)
+    expect(out.outcome).toBe('blocked'); expect(out.summary).toContain('Cannot prepare the exact preauthorized branch/base')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(before)
+    expect(f.git(['branch', '--show-current']).trim()).toBe('master')
+    expect(f.git(['branch', '--list', 'sdd/granted'])).toBe(''); didNotSpawn(f)
+  })
+  it('rejects an existing source branch collision without resetting either branch', async () => {
+    const f = fixture(); const { base, head } = newerHumanBranch(f)
+    f.git(['branch', 'sdd/granted', head]); grant(f, base)
+    const out = await f.runner.run(f.request, new AbortController().signal)
+    expect(out.outcome).toBe('blocked'); expect(out.summary).toContain('Cannot prepare the exact preauthorized branch/base')
+    expect(f.git(['branch', '--show-current']).trim()).toBe('human/current')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(head)
+    expect(f.git(['rev-parse', 'sdd/granted']).trim()).toBe(head)
+    expect(readFileSync(resolve(f.repo, 'hello.txt'), 'utf8')).toBe('newer human content\n'); didNotSpawn(f)
+  })
+  it('accepts the current granted source branch only at its exact admitted base', async () => {
+    const f = fixture(); const base = f.git(['rev-parse', 'HEAD']).trim()
+    f.git(['switch', '-q', '-c', 'agent/granted', base]); grant(f, base, 'agent/granted')
+    expect((await f.runner.run(f.request, new AbortController().signal)).outcome).toBe('succeeded')
+    expect(f.git(['branch', '--show-current']).trim()).toBe('agent/granted')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(base)
+    expect(f.git(['status', '--porcelain'])).toBe('')
+  })
+  it('does not reset a current granted branch whose HEAD has advanced beyond the base', async () => {
+    const f = fixture(); const { base, head } = newerHumanBranch(f)
+    f.git(['branch', '-m', 'sdd/current']); grant(f, base, 'sdd/current')
+    const out = await f.runner.run(f.request, new AbortController().signal)
+    expect(out.outcome).toBe('blocked'); expect(out.summary).toContain('Cannot prepare the exact preauthorized branch/base')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(head); didNotSpawn(f)
+  })
+  it('rejects dirty human work before any release branch mutation', async () => {
+    const f = fixture(); const { base, head } = newerHumanBranch(f); grant(f, base)
+    writeFileSync(resolve(f.repo, 'hello.txt'), 'uncommitted human work\n')
+    writeFileSync(resolve(f.repo, 'untracked.txt'), 'do not remove\n')
+    const before = f.git(['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+    const out = await f.runner.run(f.request, new AbortController().signal)
+    expect(out.outcome).toBe('blocked'); expect(out.summary).toContain('Dirty repository: app')
+    expect(f.git(['branch', '--show-current']).trim()).toBe('human/current')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(head)
+    expect(f.git(['branch', '--list', 'sdd/granted'])).toBe('')
+    expect(f.git(['status', '--porcelain=v1', '-z', '--untracked-files=all'])).toBe(before)
+    expect(readFileSync(resolve(f.repo, 'hello.txt'), 'utf8')).toBe('uncommitted human work\n')
+    expect(readFileSync(resolve(f.repo, 'untracked.txt'), 'utf8')).toBe('do not remove\n'); didNotSpawn(f)
+  })
+  it('leaves the clean current branch unchanged when there is no release grant', async () => {
+    const f = fixture(); const { head } = newerHumanBranch(f)
+    expect((await f.runner.run(f.request, new AbortController().signal)).outcome).toBe('succeeded')
+    expect(f.git(['branch', '--show-current']).trim()).toBe('human/current')
+    expect(f.git(['rev-parse', 'HEAD']).trim()).toBe(head)
+  })
+})
+
 describe('read-only preflight', () => {
   it('rejects dirty/untracked repos and excluded repository aliases', async () => {
     const f = fixture(); writeFileSync(resolve(f.repo, 'new.txt'), 'dirty')

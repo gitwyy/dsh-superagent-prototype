@@ -11,7 +11,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 
 const GIT = '/usr/bin/git'
 const MAX_CAPTURE = 8 * 1024 * 1024
-const MAX_SOURCE = 64 * 1024 * 1024
+const MAX_SOURCE = 256 * 1024 * 1024
 const SAFE_GIT = ['--no-replace-objects', '--literal-pathspecs', '--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'commit.gpgsign=false', '-c', 'tag.gpgSign=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'maintenance.autoDetach=false', '-c', 'credential.helper=', '-c', 'protocol.allow=never', '-c', 'protocol.file.allow=never']
 const inside = (root, path) => { const r = relative(root, path); return r === '' || (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) }
 const hash = value => createHash('sha256').update(value).digest('hex')
@@ -196,7 +196,7 @@ export function createActions(inputPolicy, guard, options = {}) {
     const checked = guard.checkedPath(resolve(root, name), write)
     if (checked.path !== resolve(root, name) || checked.root !== root) deny('Source belongs to another repository scope')
     // Extra broker guard: metadata, CI executable hooks and auth material never become commits accidentally.
-    if (name.split(/[\\/]/).some(part => /^\.git$/i.test(part) || /^\.env(?:\.|$)/i.test(part) || /^(?:credentials?|secrets?|auth)(?:\.|$)/i.test(part))) deny('Protected action source path')
+    if (name.split(/[\\/]/).some(part => /^\.git$/i.test(part) || /^\.env(?:\.|$)/i.test(part) || /^(?:credentials?|secrets?)(?:\.|$)|^auth\.(?:json|ya?ml|properties)$/i.test(part))) deny('Protected action source path')
     return checked.path
   }
   function sourceSnapshot(root) {
@@ -207,8 +207,10 @@ export function createActions(inputPolicy, guard, options = {}) {
       if (!match || match[2] !== '0' || !['100644', '100755'].includes(match[1])) deny('Symlink, submodule or unresolved index entries are unsupported')
       names.push(match[3])
     }
+    const tracked = new Set(names)
     names.push(...nulList(gitSync(root, ['ls-files', '--others', '--exclude-standard', '-z'])))
-    if (names.length > 10_000) deny('Source inventory exceeds action limit')
+    if (names.length > 50_000) deny('Source inventory exceeds action limit')
+    const changed = new Set([...nulList(gitSync(root, ['diff', '--name-only', '-z', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'HEAD'])), ...nulList(gitSync(root, ['ls-files', '--others', '--exclude-standard', '-z']))])
     const digest = createHash('sha256'); let bytes = 0
     for (const name of [...new Set(names)].sort()) {
       let path
@@ -216,7 +218,18 @@ export function createActions(inputPolicy, guard, options = {}) {
       catch (error) {
         // A tracked deletion is allowed only after the write guard authorizes the missing path.
         if (!existsSync(resolve(root, name))) { checkedFile(root, name, true); continue }
-        throw error
+        // An unchanged tracked protected file participates ONLY in a host-private digest.
+        // Its content is never returned to Pi, and any modification/removal still fails the write guard.
+        if (!tracked.has(name) || changed.has(name) || !name || isAbsolute(name) || !inside(root, resolve(root, name))) throw error
+        const parts = name.split('/'); let cursor = root
+        if (parts.some(part => part === '..' || part.toLowerCase() === '.git')) throw error
+        for (const part of parts) {
+          cursor = resolve(cursor, part); const info = lstatSync(cursor)
+          if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()) || (info.isFile() && info.nlink !== 1)) throw error
+          if (info.isDirectory() && cursor !== root && existsSync(resolve(cursor, '.git'))) throw error
+          if ((policy.registry ?? []).some(repo => repo !== root && repo === cursor)) throw error
+        }
+        path = cursor
       }
       const source = fileBytes(path)
       bytes += source.bytes.length

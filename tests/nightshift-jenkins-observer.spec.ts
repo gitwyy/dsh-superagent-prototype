@@ -24,7 +24,7 @@ function fixture(kind: 'java' | 'web' = 'java') {
   const release: Json = kind === 'java'
     ? { source_instance: 'https://git.example.test', source: SHA, project: '445', ref: 'refs/heads/master', mode: 'master-auto', jenkins_url: `${ORIGIN}/`, jenkins_job: JOB, jenkins_build: String(NUMBER), target: { namespace: 'test-namespace', deployment: 'app' }, result: 'ready', image: `registry.test/app@sha256:${ARTIFACT}`, before_image: 'registry.test/app:previous', generation: 4, pods: ['app-abc-123'], health_basis: 'rollout+pods' }
     : { service: 'app-web', source: SHA, image: `registry.test/app-web@sha256:${ARTIFACT}`, result: 'ready', patch_attempted: true, stage: 'runtime-verification', config: { uid: 'config-uid', resource_version: '42', sha256: WEB }, generation: 4, pods: ['web-abc-123'] }
-  const attempt: Json = kind === 'java' ? { ...release } : { service: 'app-web', source: SHA, branch: 'master', url: 'https://git.example.test/payment/refactor/app.git', mode: 'master-auto', attempt: 'attempt-1', result: 'ready', cleanup: true, profile: 'build-only', possible_partial_update: false, release: structuredClone(release), audit: { environment: 'test', service: 'app-web', source: SHA, result: 'ready' }, image_inputs: { source: SHA } }
+  const attempt: Json = kind === 'java' ? { ...release } : { service: 'app-web', source: SHA, branch: 'master', url: 'https://git.example.test/payment/refactor/app.git', mode: 'master-auto', attempt: 'attempt-1', result: 'ready', cleanup: true, profile: 'build-only', possible_partial_update: false, release: structuredClone(release), audit: { environment: 'test', service: 'app-web', source: SHA, result: 'passed', mode: 'master-auto', profile: 'build-only', tests_executed: false, config_sha256: CONFIG }, image_inputs: { source: SHA } }
   const queue: Json = { items: [] }, list: Json = { builds: [build] }
   const responses = new Map<string, unknown>([
     ['/queue/api/json', queue], [`${jobPath(JOB)}/api/json`, list], [`${jobPath(JOB)}/${NUMBER}/api/json`, build],
@@ -123,6 +123,34 @@ describe('pinned GET-only Jenkins observer', () => {
 })
 
 describe('exact build selection and remote activity', () => {
+  it('observes a recent unique source in a long-lived job only when the 101st timestamp proves the grant-era window complete', async () => {
+    const h = fixture(), now = Date.now()
+    h.attestation.notBefore = new Date(now - 5000).toISOString()
+    h.build.timestamp = now - 1000
+    h.list.builds = [h.build, ...Array.from({ length: 100 }, (_, index) => ({ number: 1000 - index, queueId: 2000 - index, timestamp: now - (index + 2) * 1000, result: 'SUCCESS', building: false, actions: [{ lastBuiltRevision: { SHA1: OTHER } }] }))]
+    expect((await h.observe()).deployment!.state).toBe('succeeded')
+    expect(h.fetcher.mock.calls.some(([url]) => String(url).includes('timestamp'))).toBe(true)
+    expect(h.fetcher).toHaveBeenCalledTimes(5)
+  })
+
+  it.each(['no-bound', 'boundary-not-crossed', 'boundary-equal', 'future-time', 'missing-time', 'unordered-time', 'duplicate-before-signing', 'source-before-grant', 'readback-time-drift'] as const)('keeps long-history %s evidence unknown rather than guessing latest', async invalid => {
+    const h = fixture(), now = Date.now(), issuedAt = now - 5000
+    h.attestation.notBefore = new Date(issuedAt).toISOString()
+    h.build.timestamp = now - 1000
+    h.list.builds = [h.build, ...Array.from({ length: 100 }, (_, index) => ({ number: 1000 - index, queueId: 2000 - index, timestamp: now - (index + 2) * 1000, result: 'SUCCESS', building: false, actions: [{ lastBuiltRevision: { SHA1: OTHER } }] }))]
+    if (invalid === 'no-bound') delete h.attestation.notBefore
+    if (invalid === 'boundary-not-crossed') h.attestation.notBefore = new Date(now - 200_000).toISOString()
+    if (invalid === 'boundary-equal') h.attestation.notBefore = new Date(h.list.builds[100].timestamp).toISOString()
+    if (invalid === 'future-time') h.build.timestamp = now + 60_000
+    if (invalid === 'missing-time') delete h.list.builds[20].timestamp
+    if (invalid === 'unordered-time') h.list.builds[20].timestamp = now - 500
+    // Ticket signing was now-2000; duplicate now-3000 is earlier than signing but later than grant.
+    if (invalid === 'duplicate-before-signing') h.list.builds[2].actions = [{ lastBuiltRevision: { SHA1: SHA } }]
+    if (invalid === 'source-before-grant') h.list.builds[99].actions = [{ lastBuiltRevision: { SHA1: SHA } }]
+    if (invalid === 'readback-time-drift') h.responses.set(`${jobPath(JOB)}/${NUMBER}/api/json`, { ...h.build, timestamp: now - 500 })
+    expect((await h.observe()).deployment).toMatchObject({ state: 'unknown', healthy: false })
+  })
+
   it('never chooses newest when multiple builds claim the same source', async () => {
     const h = fixture(); h.list.builds = [h.build, { ...h.build, number: 58, queueId: 102 }]
     expect((await h.observe()).deployment!.state).toBe('unknown')
@@ -184,6 +212,17 @@ describe('exact build selection and remote activity', () => {
     expect((await h.observe()).deployment!.state).toBe('unknown')
   })
 
+  it('flags only an unexpired exact-merge visibility gap as awaiting webhook, never conflicts or expiry', async () => {
+    const h = fixture(); h.list.builds = []
+    expect((await h.observe()).deployment).toMatchObject({ state: 'unknown', healthy: false, ids: [], awaitingWebhook: true })
+    h.attestation.deadline = future(-1)
+    expect((await h.observe()).deployment).not.toHaveProperty('awaitingWebhook')
+    h.attestation.deadline = future(); h.snapshot.mergeRequest!.mergeCommitVerified = false
+    expect((await h.observe()).deployment).not.toHaveProperty('awaitingWebhook')
+    h.snapshot.mergeRequest!.mergeCommitVerified = true; h.list.builds = [h.build, { ...h.build, number: 58, queueId: 102 }]
+    expect((await h.observe()).deployment).not.toHaveProperty('awaitingWebhook')
+  })
+
   it('does not substitute another SHA or reuse a simultaneous queued retry', async () => {
     const h = fixture(); h.build.actions = [{ lastBuiltRevision: { SHA1: OTHER } }]
     expect((await h.observe()).deployment!.state).toBe('unknown')
@@ -219,13 +258,13 @@ describe('artifact identity and runtime health proofs', () => {
   it('checks optional Java publisher fingerprint against pinned manifest without exposing its arbitrary config', async () => {
     const h = fixture(); Object.assign(h.attestation.targets[JOB]!, { publisherFingerprint: WEB })
     const manifest = { source: SHA, project: '445', environment: 'test', jenkins_job: JOB, jenkins_build: String(NUMBER), config_fingerprint: WEB, target: { namespace: 'test-namespace', deployment: 'app', container: 'app' }, image: h.release.image, private_config: 'MUST_NOT_ESCAPE' }
-    h.responses.set(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/manifest.json`, manifest)
+    h.responses.set(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/release-manifest.json`, manifest)
     const result = await h.observe(); expect(result.deployment!.state).toBe('succeeded'); expect(JSON.stringify(result)).not.toContain('MUST_NOT_ESCAPE')
     manifest.config_fingerprint = CONFIG
     expect((await h.observe()).deployment!.state).toBe('unknown')
   })
 
-  it.each(['service', 'source', 'config-uid', 'config-hash', 'stage', 'patch', 'attempt-partial', 'attempt-cleanup', 'attempt-source-url', 'attempt-branch', 'attempt-profile', 'nested-generation', 'audit-environment', 'image-source'] as const)('denies Web %s artifact evidence', async invalid => {
+  it.each(['service', 'source', 'config-uid', 'config-hash', 'stage', 'patch', 'release-not-ready', 'attempt-partial', 'attempt-cleanup', 'attempt-source-url', 'attempt-branch', 'attempt-profile', 'nested-generation', 'audit-environment', 'audit-not-passed', 'audit-mode', 'audit-profile', 'audit-tests', 'audit-config', 'image-source'] as const)('denies Web %s artifact evidence', async invalid => {
     const h = fixture('web')
     if (invalid === 'service') h.release.service = 'another'
     if (invalid === 'source') h.release.source = OTHER
@@ -233,6 +272,7 @@ describe('artifact identity and runtime health proofs', () => {
     if (invalid === 'config-hash') h.release.config.sha256 = CONFIG
     if (invalid === 'stage') h.release.stage = 'build-only'
     if (invalid === 'patch') h.release.patch_attempted = false
+    if (invalid === 'release-not-ready') h.release.result = 'passed'
     if (invalid === 'attempt-partial') h.attempt.possible_partial_update = true
     if (invalid === 'attempt-cleanup') h.attempt.cleanup = false
     if (invalid === 'attempt-source-url') h.attempt.url = 'https://other.test/repository.git'
@@ -240,8 +280,45 @@ describe('artifact identity and runtime health proofs', () => {
     if (invalid === 'attempt-profile') h.attempt.profile = 'other'
     if (invalid === 'nested-generation') h.attempt.release.generation = 99
     if (invalid === 'audit-environment') h.attempt.audit.environment = 'production'
+    if (invalid === 'audit-not-passed') h.attempt.audit.result = 'ready'
+    if (invalid === 'audit-mode') h.attempt.audit.mode = 'manual'
+    if (invalid === 'audit-profile') h.attempt.audit.profile = 'full-verify'
+    if (invalid === 'audit-tests') h.attempt.audit.tests_executed = true
+    if (invalid === 'audit-config') h.attempt.audit.config_sha256 = 'latest'
     if (invalid === 'image-source') h.attempt.image_inputs.source = OTHER
     expect((await h.observe()).deployment).toMatchObject({ state: 'unknown', healthy: false })
+  })
+
+  it('matches captured publisher audit passed versus runtime ready without conflating build and nginx digests', async () => {
+    // Sanitized projection of decoded-mate-web-release.py validate_build_report and captured attempt/release schema.
+    const h = fixture('web')
+    expect(h.attempt.audit.result).toBe('passed')
+    expect(h.release.result).toBe('ready')
+    expect(h.attempt.audit.config_sha256).not.toBe(h.release.config.sha256)
+    const target = h.attestation.targets[JOB]!
+    if (target.kind !== 'web') throw new Error('Fixture target mismatch')
+    target.buildConfigSha256 = CONFIG
+    expect((await h.observe()).deployment!.state).toBe('succeeded')
+    h.attempt.audit.config_sha256 = WEB // Still well-formed, but wrong optional operator build-config pin.
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+    delete target.buildConfigSha256
+    expect((await h.observe()).deployment!.state).toBe('succeeded')
+    target.profile = h.attempt.profile = h.attempt.audit.profile = 'full-verify'
+    h.attempt.audit.tests_executed = true
+    expect((await h.observe()).deployment!.state).toBe('succeeded')
+    h.release.result = 'passed'
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+  })
+
+  it('uses the captured Java release-manifest.json endpoint only, with no guessed manifest fallback', async () => {
+    // jenkins-artifact-contract.json captured mate-account#57 and mate-data-center-export#71 use this relativePath.
+    const h = fixture(); Object.assign(h.attestation.targets[JOB]!, { publisherFingerprint: WEB })
+    const manifest = { source: SHA, project: '445', environment: 'test', jenkins_job: JOB, jenkins_build: String(NUMBER), config_fingerprint: WEB, target: { namespace: 'test-namespace', deployment: 'app' }, image: h.release.image }
+    h.responses.set(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/manifest.json`, manifest)
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+    expect(h.fetcher.mock.calls.some(([url]) => new URL(String(url)).pathname.endsWith('/jenkins-evidence/manifest.json'))).toBe(false)
+    h.responses.set(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/release-manifest.json`, manifest)
+    expect((await h.observe()).deployment!.state).toBe('succeeded')
   })
 
   it('returns complete separate facts only after every configured sibling build verifies', async () => {

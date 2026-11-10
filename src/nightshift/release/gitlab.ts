@@ -19,6 +19,11 @@ export interface GitlabTransportOptions {
   /** Test seams, not policy/model capabilities. */
   push?: (request: GitPushRequest) => Promise<{ remoteIds: string[]; detail: string }>
   runGit?: GitPushOptions['runGit']
+  /** Host-owned signed deployment metadata, never accepted from model descriptions. */
+  deploymentTickets?: {
+    metadata(context: DispatchContext): Promise<string>
+    verify(context: DispatchContext, description: string): Promise<void>
+  }
 }
 type Json = Record<string, any>
 const id = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0
@@ -191,9 +196,12 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
       if (fresh.sourceSha !== request.sha) reject('Exact candidate must already be pushed')
       if (request.action === 'create_mr') {
         if (fresh.mergeRequest) return { remoteIds: [`mr:${repository.projectId}:${fresh.mergeRequest.iid}`], detail: 'Exact marked merge request already exists; no duplicate sent' }
-        if (!request.title?.trim() || request.title.length > 250 || (request.description?.length ?? 0) > 8000 || /nightshift:/.test(request.description ?? '')) reject('Invalid bounded merge request title/description')
+        if (!request.title?.trim() || request.title.length > 250 || (request.description?.length ?? 0) > 8000 || /nightshift:|superagent-deploy-v1/.test(request.description ?? '')) reject('Invalid bounded merge request title/description')
+        const needsTickets = repository.mergeTriggersDeploy && scope.actions.includes('merge')
+        const metadata = needsTickets ? await options.deploymentTickets?.metadata(context) : ''
+        if (needsTickets && (!metadata || metadata.length > 60000)) reject('Signed deployment metadata is required for merge-triggered deployment')
         liveBoundary(context, boundedSignal)
-        const response = await client.request(`${prefix}/merge_requests`, 'POST', { source_branch: scope.sourceBranch, target_branch: scope.targetBranch, title: request.title, description: `${request.description ?? ''}\n\n${releaseMarker(request.taskId, request.repository, request.sha)}`, remove_source_branch: false, squash: false, allow_collaboration: false })
+        const response = await client.request(`${prefix}/merge_requests`, 'POST', { source_branch: scope.sourceBranch, target_branch: scope.targetBranch, title: request.title, description: `${request.description ?? ''}\n\n${releaseMarker(request.taskId, request.repository, request.sha)}${metadata ? `\n\n${metadata}` : ''}`,  remove_source_branch: false, squash: false, allow_collaboration: false })
         const body = response?.value as Json | undefined
         if (!id(body?.iid)) reject('Merge request response uncertain; reconcile by marker without retry')
         return { remoteIds: [`mr:${repository.projectId}:${body.iid}`], detail: 'One merge request creation accepted; exact marked readback required' }
@@ -205,6 +213,10 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
       const target = await client.json(`${prefix}/repository/branches/${encodeURIComponent(scope.targetBranch)}`)
       const head = await client.json(`${prefix}/merge_requests/${mr.iid}`)
       if (finalProject?.merge_method !== 'ff' || finalProject.only_allow_merge_if_pipeline_succeeds !== true || finalProject.squash_option === 'always' || target?.commit?.id !== scope.baseSha || head?.sha !== request.sha || head.state !== 'opened' || head.squash === true || head.squash_on_merge === true) reject('Source, target or merge policy drifted at final merge read')
+      if (repository.mergeTriggersDeploy) {
+        if (!options.deploymentTickets || typeof head.description !== 'string') reject('Signed deployment ticket verification unavailable')
+        await options.deploymentTickets.verify(context, head.description)
+      }
       liveBoundary(context, boundedSignal)
       await client.request(`${prefix}/merge_requests/${mr.iid}/merge`, 'PUT', { sha: request.sha, squash: false, should_remove_source_branch: false, merge_when_pipeline_succeeds: false })
       return { remoteIds: [`mr:${repository.projectId}:${mr.iid}`, `sha:${request.sha}`], detail: 'One immediate FF-only merge request accepted; exact merged-SHA readback required' }

@@ -290,6 +290,8 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 
 | Path | Responsibility |
 | --- | --- |
+| `src/nightshift/release/deployment-tickets.ts` | Host-signed immutable per-job deployment grants, exact metadata verification and read-only evidence |
+| `src/nightshift/release/composite-transport.ts` | GitLab, signed tickets and Jenkins observer composition with fresh private attestations |
 | `src/nightshift/release/contracts.ts` | Host-only release grants, immutable scope and remote evidence contracts |
 | `src/nightshift/release/coordinator.ts` | Durable release admission, live revocation, exact-SHA gates and read-only reconciliation |
 | `src/nightshift/release/journal.ts` | Persistent single-owner intent journal and restart ambiguity handling |
@@ -429,6 +431,14 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/drive-exclusion.spec.ts` | Cross-entry exclusion of enrolled nightshift workspaces, symlink aliases and malformed registry failure |
 | `tests/nightshift-controller.spec.ts` | Durable task authorization, serial dispatch, cancellation races, locks and restart ambiguity |
 | `tests/nightshift-runner.spec.ts` | Fake Pi RPC lifecycle and scoped guard execution in disposable repositories |
+| `tests/jenkins-observer-setup.spec.ts` | Offline reviewed ACL migration/rollback contract and real hybrid encryption interoperability |
+| `tests/jenkins-assets.spec.ts` | Fixed-root encrypted gate asset handoff and whitelist/private-state contracts |
+| `tests/nightshift-publisher-hook.spec.ts` | Existing Java/frontend publisher gate patches, actor/target grants and secret mount separation |
+| `tests/nightshift-deployment-tickets.spec.ts` | Immutable signed MR metadata and Python gate interoperability |
+| `tests/nightshift-composite-transport.spec.ts` | Cross-adapter ticket/attestation binding, expiry and last-boundary revocation |
+| `tests/nightshift-source-actor.spec.ts` | Trusted webhook actor provenance and preserved manual source selection |
+| `tests/nightshift-source-check.spec.ts` | Fixed non-executing local source gate, exact changed/staged files, and explicit no-tests/no-compile evidence |
+| `tests/nightshift-release-flow.spec.ts` | Real host receipt/coordinator/transport/ticket/observer composition with fake remote writes and signed gate evidence |
 | `tests/nightshift-release.spec.ts` | Durable remote intent, exact grants/identity/CI and automatic-deploy reconciliation |
 | `tests/nightshift-gitlab-release.spec.ts` | Bounded credential-safe GitLab transport and isolated exact-SHA Git push |
 | `tests/nightshift-jenkins-gate.spec.ts` | Offline signed single-use remote write admission, deadline/freeze and path protection |

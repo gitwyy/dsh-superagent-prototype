@@ -29,6 +29,7 @@
     "resources/nightshift-guard.mjs",
     "resources/nightshift-actions.mjs",
     "resources/nightshift-client.mjs",
+    "resources/nightshift-source-check.py",
     "skills"
   ],
   "dsh": {

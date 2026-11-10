@@ -40,6 +40,7 @@ export interface NightConfig {
   repositoryActions?: Record<string, RepositoryActions>
   /** Host-only release policy. Credentials and route details must never be serialized into Pi environment. */
   releasePolicy?: ReleasePolicy
+  releaseRuntime?: { keyId: string; keyFile: string; ticketDir: string; attestationFile: string }
   provider?: string
   model?: string
   thinking?: string

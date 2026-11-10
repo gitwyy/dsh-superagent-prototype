@@ -109,11 +109,26 @@ export class PiRunner implements Runner {
     } catch { return result('blocked', 'Runner resource configuration is invalid or unavailable') }
     const baseline: Record<string, { head: string; branch: string }> = {}
     try {
+      if (task.releaseGrant) for (const scope of task.releaseGrant.scopes) {
+        const root = repositories[scope.repository]
+        if (!root || !task.repositories.includes(scope.repository) || task.access !== 'write' || !task.approved) throw new Error('Invalid release branch scope')
+        signal.throwIfAborted(); this.options.assertAuthorized?.(request)
+        if (Date.now() >= deadline) throw new Error('Run deadline expired')
+        await safeGit(root, ['cat-file', '-e', `${scope.baseSha}^{commit}`], config)
+        const head = (await safeGit(root, ['rev-parse', 'HEAD'], config)).trim()
+        const branch = (await safeGit(root, ['branch', '--show-current'], config)).trim()
+        if (branch !== scope.sourceBranch) {
+          // Only create the explicitly preauthorized new branch at the immutable admitted base.
+          // Existing branch collision fails; never reset, overwrite, rebase or use a guessed latest ref.
+          signal.throwIfAborted(); this.options.assertAuthorized?.(request)
+          await safeGit(root, ['switch', '--no-guess', '--no-recurse-submodules', '-c', scope.sourceBranch, scope.baseSha], config)
+        } else if (head !== scope.baseSha) throw new Error('Existing release branch is not at its admitted base')
+      }
       for (const name of task.repositories) {
         baseline[name] = { head: (await safeGit(repositories[name]!, ['rev-parse', 'HEAD'], config)).trim(),
           branch: (await safeGit(repositories[name]!, ['branch', '--show-current'], config)).trim() }
       }
-    } catch { return result('blocked', 'Cannot pin the task repository baseline') }
+    } catch { return result('blocked', 'Cannot prepare the exact preauthorized branch/base; synchronize the required base commit manually without resetting human work') }
     const args = ['--mode', 'rpc', '--session', config.sessionFile, '--session-dir', dirname(config.sessionFile),
       '--no-extensions', '--extension', guardPath, '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-approve', '--offline', '--tools', TOOLS,
       '--provider', config.provider!, '--model', config.model!]

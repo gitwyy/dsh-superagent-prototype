@@ -9,7 +9,9 @@ export const NIGHT_HELP = [
   '写任务格式：入队 修改 mate-account,mate-workspace | 已确认的 spec/task 与范围',
   '批准任务 <任务ID>  — 确认该条任务的仓与读/写范围；不授予合并/部署权限',
   '授权动作 <任务ID> 验证,提交  — 额外允许本地受审验证程序/提交；默认无，不允许发布/合并',
-  '开始夜班 截止 2026-11-10T07:00:00+08:00  — 必须是未来 12 小时内的明确截止时间',
+  '预授权发布 <任务ID> 截止 <带时区ISO时间> | <范围JSON数组>  — 指定仓库、源/目标分支、基线SHA、test环境与push/create_mr/merge/deploy动作',
+  '发布状态 / 核查发布 <操作ID>  — 只读对账，不重发远端动作',
+  '开始夜班 截止 <带时区ISO时间>  — 必须是未来 12 小时内的明确截止时间',
   '状态 / 队列 / 帮助',
   '暂停 / 我要接班 / 取消任务 <任务ID>',
   '确认恢复  — 仅对已核对现场的恢复请求；未知结果的任务不会自动重跑',
@@ -41,7 +43,7 @@ export function parseNightCommand(text: string): Command {
   const start = /^开始夜班\s+截止\s+(\S+)$/u.exec(value)
   if (start) {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})$/.test(start[1]!) || !Number.isFinite(Date.parse(start[1]!))) {
-      throw new Error('截止时间必须带日期、时间和时区，例如 2026-11-10T07:00:00+08:00。')
+      throw new Error('截止时间必须带日期、时间和时区，格式为 YYYY-MM-DDTHH:mm:ss+08:00。')
     }
     return { type: 'start', deadline: new Date(start[1]!).toISOString() }
   }

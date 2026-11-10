@@ -98,7 +98,7 @@ export interface RemoteSnapshot {
   triggerPolicyFingerprint: string
   mergeRequest?: { iid: number; sourceProjectId: number; targetProjectId: number; sourceBranch: string; targetBranch: string; sha: string; state: 'opened' | 'merged' | 'closed'; authorId: number; draft: boolean; conflicts: boolean; mergeable: boolean; approved: boolean; unresolvedDiscussions: number; mergeCommitSha?: string; mergeCommitVerified?: boolean; mergeTreeSha?: string; mergeParents?: string[]; marker: string }
   pipeline?: { id: number; sha: string; status: string; jobs: { name: string; status: string; allowFailure: boolean }[] }
-  deployment?: { routeId: string; sourceSha: string; state: 'absent' | 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; ids: string[]; destinationId: string; artifactDigest?: string; healthy: boolean; remoteDeadlineEnforced: boolean; configSha256?: Record<string, string>; deadline?: string; builds?: { job: string; id: string; sha: string; destinationId: string; state: 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; artifactDigest?: string; healthy: boolean }[] }
+  deployment?: { routeId: string; sourceSha: string; state: 'absent' | 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; ids: string[]; destinationId: string; artifactDigest?: string; healthy: boolean; remoteDeadlineEnforced: boolean; configSha256?: Record<string, string>; deadline?: string; awaitingWebhook?: boolean; builds?: { job: string; id: string; sha: string; destinationId: string; state: 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; artifactDigest?: string; healthy: boolean }[] }
 }
 export interface ReleaseOperation {
   id: string

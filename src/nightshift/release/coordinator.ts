@@ -37,7 +37,7 @@ const snapshotSchema = z.strictObject({
   sourceSha: oid.optional(), targetSha: oid, targetCiSha256: sha256, productionExcluded: z.boolean(), triggerPolicyFingerprint: name,
   mergeRequest: z.strictObject({ iid: positive, sourceProjectId: positive, targetProjectId: positive, sourceBranch: branch, targetBranch: branch, sha: oid, state: z.enum(['opened', 'merged', 'closed']), authorId: positive, draft: z.boolean(), conflicts: z.boolean(), mergeable: z.boolean(), approved: z.boolean(), unresolvedDiscussions: z.number().int().nonnegative(), mergeCommitSha: oid.optional(), mergeCommitVerified: z.boolean().optional(), mergeTreeSha: oid.optional(), mergeParents: z.array(oid).optional(), marker: name }).optional(),
   pipeline: z.strictObject({ id: positive, sha: oid, status: name, jobs: z.array(z.strictObject({ name, status: name, allowFailure: z.boolean() })) }).optional(),
-  deployment: z.strictObject({ routeId: name, sourceSha: oid, state: z.enum(['absent', 'queued', 'running', 'succeeded', 'failed', 'unknown']), ids: z.array(name).refine(unique), destinationId: name, artifactDigest: name.optional(), healthy: z.boolean(), remoteDeadlineEnforced: z.boolean(), configSha256: z.record(name, sha256).optional(), deadline: dateTime.optional(), builds: z.array(z.strictObject({ job: name, id: name, sha: oid, destinationId: name, state: z.enum(['queued', 'running', 'succeeded', 'failed', 'unknown']), artifactDigest: name.optional(), healthy: z.boolean() })).optional() }).optional(),
+  deployment: z.strictObject({ routeId: name, sourceSha: oid, state: z.enum(['absent', 'queued', 'running', 'succeeded', 'failed', 'unknown']), ids: z.array(name).refine(unique), destinationId: name, artifactDigest: name.optional(), healthy: z.boolean(), remoteDeadlineEnforced: z.boolean(), configSha256: z.record(name, sha256).optional(), deadline: dateTime.optional(), awaitingWebhook: z.boolean().optional(), builds: z.array(z.strictObject({ job: name, id: name, sha: oid, destinationId: name, state: z.enum(['queued', 'running', 'succeeded', 'failed', 'unknown']), artifactDigest: name.optional(), healthy: z.boolean() })).optional() }).optional(),
 })
 
 function canonical(value: unknown): string {
@@ -173,10 +173,16 @@ class Coordinator implements ReleaseCoordinator {
       && deployment.deadline && Date.parse(deployment.deadline) <= Date.parse(deadline), 'Exact deployment route/config/destination/remote deadline evidence is missing')
     if (requireAbsent) requireThat(deployment.state === 'absent' && deployment.ids.length === 0 && Date.parse(deployment.deadline) > Date.now(), 'Deployment was already dispatched or remote deadline is expired')
     else if (deployment.state !== 'absent') {
-      requireThat(deployment.ids.length === route.jobs.length && deployment.builds && deployment.builds.length === route.jobs.length, 'Deployment evidence does not cover every exact configured sibling job')
-      requireThat(canonical(deployment.builds.map(build => build.job).sort()) === canonical([...route.jobs].sort())
-        && canonical(deployment.builds.map(build => build.id).sort()) === canonical([...deployment.ids].sort())
-        && deployment.builds.every(build => build.sha === request.sha && build.destinationId === route.destinationId), 'Deployment sibling job/build/SHA/destination mapping is incomplete or conflicting')
+      requireThat(deployment.builds && deployment.builds.length === deployment.ids.length && unique(deployment.builds.map(build => build.job))
+        && deployment.builds.every(build => route.jobs.includes(build.job) && build.sha === request.sha && build.destinationId === route.destinationId)
+        && canonical(deployment.builds.map(build => build.id).sort()) === canonical([...deployment.ids].sort()), 'Deployment sibling job/build/SHA/destination mapping is incomplete or conflicting')
+      if (deployment.awaitingWebhook === true) {
+        const mr = this.mr(snapshot, request, scope, repository)
+        requireThat(deployment.state === 'unknown' && !deployment.healthy && deployment.builds.length < route.jobs.length
+          && deployment.builds.every(build => ['queued', 'running', 'succeeded'].includes(build.state)) && Date.parse(deployment.deadline) > Date.now()
+          && snapshot.project.fastForwardOnly === true && mr.state === 'merged' && mr.sha === request.sha && mr.mergeCommitSha === request.sha
+          && mr.mergeCommitVerified === true && snapshot.targetSha === request.sha, 'Webhook wait is not backed by exact merged identity and an unexpired signed deadline')
+      } else requireThat(canonical(deployment.builds.map(build => build.job).sort()) === canonical([...route.jobs].sort()), 'Deployment evidence does not cover every exact configured sibling job')
     }
   }
   private preconditions(snapshot: RemoteSnapshot, request: ReleaseRequest, admission: Admission, candidate: CandidateEvidence): void {
@@ -203,7 +209,7 @@ class Coordinator implements ReleaseCoordinator {
       requireThat(mr.state === 'merged' && mr.mergeCommitSha === request.sha && mr.mergeCommitVerified === true && mr.mergeTreeSha === candidate.treeSha && snapshot.targetSha === request.sha, 'Deployment requires verified exact fast-forward merged source/tree/target')
       requireThat(repository.mergeTriggersDeploy && scope.actions.includes('merge'), 'Deploy is observation-only for a previously authorized webhook-triggering merge')
       this.route(snapshot, request, admission, false)
-      requireThat(snapshot.deployment!.state !== 'absent' && snapshot.deployment!.ids.length > 0, 'No exact webhook-created deployment IDs are available to adopt')
+      requireThat(snapshot.deployment!.awaitingWebhook !== true && snapshot.deployment!.state !== 'absent' && snapshot.deployment!.ids.length > 0, 'All exact webhook-created deployment IDs must be available before adoption')
     }
   }
 
@@ -244,7 +250,7 @@ class Coordinator implements ReleaseCoordinator {
         intent.deadline = admission.deadline
         if (request.action === 'deploy') {
           const builds = Object.fromEntries(snapshot.deployment!.builds!.map(build => [build.job, build.id]))
-          if (parentMerge!.deploymentIds) requireThat(canonical([...parentMerge!.deploymentIds].sort()) === canonical([...snapshot.deployment!.ids].sort()) && canonical(parentMerge!.deploymentBuilds) === canonical(builds), 'Webhook deployment IDs/job mapping changed from the parent merge observation')
+          if (parentMerge!.deploymentIds) requireThat(parentMerge!.deploymentIds.every(id => snapshot.deployment!.ids.includes(id)) && Object.entries(parentMerge!.deploymentBuilds ?? {}).every(([job, id]) => builds[job] === id), 'Webhook deployment IDs/job mapping changed from the parent merge observation')
           intent.deploymentIds = [...snapshot.deployment!.ids]; intent.deploymentBuilds = builds
           // Merge already triggered the webhook. Deploy permission permits observing/adopting it, never a second trigger.
           intent.operation.state = 'accepted'; intent.operation.remoteIds = [...snapshot.deployment!.ids]; intent.remoteActive = true
@@ -299,8 +305,10 @@ class Coordinator implements ReleaseCoordinator {
           const deployment = snapshot.deployment!
           if (deployment.state === 'absent') return
           const builds = Object.fromEntries(deployment.builds!.map(build => [build.job, build.id]))
-          if (intent.deploymentIds) requireThat(canonical([...intent.deploymentIds].sort()) === canonical([...deployment.ids].sort()) && canonical(intent.deploymentBuilds) === canonical(builds), 'Webhook-created build IDs/job mapping changed; a retry/replacement is not the admitted operation')
-          else { intent.deploymentIds = [...deployment.ids]; intent.deploymentBuilds = builds }
+          if (intent.deploymentBuilds) requireThat(Object.entries(intent.deploymentBuilds).every(([job, id]) => builds[job] === id), 'Previously observed webhook job disappeared or changed IDs; a retry/replacement is not the admitted operation')
+          if (intent.deploymentIds) requireThat(intent.deploymentIds.every(id => deployment.ids.includes(id)), 'Previously observed webhook build IDs disappeared')
+          // A partial sibling set may grow monotonically, but no known job/ID can disappear or be replaced.
+          intent.deploymentIds = [...deployment.ids]; intent.deploymentBuilds = builds
         }
         const deployed = () => snapshot.deployment!.state === 'succeeded' && snapshot.deployment!.healthy === true
           && !!snapshot.deployment!.builds?.length && snapshot.deployment!.builds.every(build => build.state === 'succeeded' && build.healthy === true && /^sha256:[a-f0-9]{64}$/.test(build.artifactDigest ?? ''))
@@ -309,6 +317,7 @@ class Coordinator implements ReleaseCoordinator {
         else if (request.action === 'merge') {
           const mr = this.mr(snapshot, request, scope, repository)
           proved = snapshot.project.fastForwardOnly === true && mr.state === 'merged' && mr.mergeCommitSha === request.sha && mr.mergeCommitVerified === true && mr.mergeTreeSha === intent.candidate.treeSha && snapshot.targetSha === request.sha
+          if (snapshot.deployment?.awaitingWebhook) requireThat(proved && repository.mergeTriggersDeploy, 'Webhook wait cannot replace verified merged source/tree evidence')
           if (proved && repository.mergeTriggersDeploy) {
             this.route(snapshot, request, { repository, scope, grant: intent.grant, deadline: intent.deadline }, false)
             pinDeployment()

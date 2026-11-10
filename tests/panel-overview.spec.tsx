@@ -13,7 +13,7 @@ it('shows fixed-workspace manual mode without pretending the legacy ticket count
   expect(text()).toContain('Mate v2 单会话夜班')
   expect(text()).toContain('DAY_MANUAL')
   expect(text()).toContain('/fixed/mate-workspace')
-  expect(text()).toContain('推送与建 MR 尚未启用')
+  expect(text()).toContain('发布按任务预授权与证据门禁执行')
   expect(text()).not.toContain('过去 24 小时')
 })
 it('leads the overview with the pending Tickets, then problems, the last day and the Executor, each linking to its stage', async () => {

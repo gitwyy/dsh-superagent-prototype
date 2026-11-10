@@ -7,10 +7,12 @@ import { releaseMarker, type DeploymentRoute, type ReleaseRepository, type Relea
 export interface JenkinsObservationContext { repository: ReleaseRepository; scope: ReleaseScope; request: ReleaseRequest }
 export type JenkinsAttestedTarget =
   | { kind: 'java'; project: string; sourceInstance: string; namespace: string; deployment: string; jenkinsUrl?: string; ref?: string; mode?: string; publisherFingerprint?: string }
-  | { kind: 'web'; service: string; config: { uid: string; sha256: string }; sourceUrl: string; branch?: string; profile?: string }
+  | { kind: 'web'; service: string; config: { uid: string; sha256: string }; sourceUrl: string; branch?: string; profile?: string; buildConfigSha256?: string }
 /** Host-owned route proof; never constructed from model arguments or untrusted Jenkins artifacts. */
 export interface JenkinsDeploymentAttestation {
   expiresAt: string
+  /** Trusted lower bound preceding this task's receipted source creation, never the later MR signing time. */
+  notBefore?: string
   configSha256: Record<string, string>
   deadline: string
   remoteDeadlineEnforced: boolean
@@ -100,6 +102,7 @@ class JenkinsReader {
   }
 }
 function validateAttestation(value: JenkinsDeploymentAttestation, route: DeploymentRoute): void {
+  must(value.notBefore === undefined || (Number.isFinite(instant(value.notBefore)) && instant(value.notBefore) <= Date.now()))
   must(instant(value.expiresAt) > Date.now() && Number.isFinite(instant(value.deadline)) && value.remoteDeadlineEnforced === true && route.remoteDeadlineEnforced === true && value.destinationId === route.destinationId)
   must(exactKeys(object(value.configSha256), route.jobs) && exactKeys(object(value.targets), route.jobs))
   for (const job of route.jobs) {
@@ -112,7 +115,8 @@ function validateAttestation(value: JenkinsDeploymentAttestation, route: Deploym
       if (target.jenkinsUrl !== undefined) { const url = new URL(target.jenkinsUrl); must(url.origin === route.origin && !url.username && !url.password && !url.search && !url.hash) }
       if (target.ref !== undefined) must(text(target.ref))
       if (target.mode !== undefined) must(text(target.mode))
-    } else must(text(target.service) && text(target.config?.uid) && hash(target.config?.sha256) && text(target.sourceUrl))
+    } else must(text(target.service) && text(target.config?.uid) && hash(target.config?.sha256) && text(target.sourceUrl)
+      && (target.buildConfigSha256 === undefined || hash(target.buildConfigSha256)))
   }
 }
 /** All explicit SHA signals on a build must agree; branch names and “latest” are never content identity. */
@@ -173,7 +177,7 @@ async function verifyArtifacts(reader: JenkinsReader, context: JenkinsObservatio
     javaIdentity(release, context, target, job, number, origin); javaIdentity(attempt, context, target, job, number, origin)
     must(attempt.result === 'ready' && attempt.image === release.image && text(release.before_image) && text(release.health_basis))
     if (target.publisherFingerprint) {
-      const manifest = await reader.get(`${path}/artifact/jenkins-evidence/manifest.json`, true)
+      const manifest = await reader.get(`${path}/artifact/jenkins-evidence/release-manifest.json`, true)
       must(manifest)
       const destination = object(manifest.target)
       must(manifest.source === context.request.sha && manifest.project === target.project && manifest.environment === context.scope.environment
@@ -189,7 +193,10 @@ async function verifyArtifacts(reader: JenkinsReader, context: JenkinsObservatio
     webIdentity(nested, context, target)
     must(healthyRelease(nested) === artifactDigest && nested.generation === release.generation && JSON.stringify(nested.pods) === JSON.stringify(release.pods)
       && object(nested.config).resource_version === object(release.config).resource_version
-      && audit.environment === context.scope.environment && audit.service === target.service && audit.source === context.request.sha && audit.result === 'ready'
+      && audit.environment === context.scope.environment && audit.service === target.service && audit.source === context.request.sha && audit.result === 'passed'
+      && audit.mode === attempt.mode && ['master-auto', 'manual'].includes(String(audit.mode)) && audit.profile === attempt.profile
+      && ['build-only', 'full-verify'].includes(String(audit.profile)) && audit.tests_executed === (audit.profile === 'full-verify') && hash(audit.config_sha256)
+      && (target.buildConfigSha256 === undefined || audit.config_sha256 === target.buildConfigSha256)
       && imageInputs.source === context.request.sha)
   }
   return artifactDigest
@@ -217,14 +224,27 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
     let missing = false
     for (const job of route.jobs) {
       validateAttestation(attestation, route)
-      const list = await reader.get(`${jobPath(job)}/api/json?tree=builds[number,result,building,queueId,actions[lastBuiltRevision[SHA1],parameters[name,value]]]{0,101}`)
-      must(list && Array.isArray(list.builds) && list.builds.length <= 100)
+      const list = await reader.get(`${jobPath(job)}/api/json?tree=builds[number,timestamp,result,building,queueId,actions[lastBuiltRevision[SHA1],parameters[name,value]]]{0,101}`)
+      must(list && Array.isArray(list.builds) && list.builds.length <= 101)
       const numbers = new Set<number>(), matches: Json[] = []
+      const truncated = list.builds.length === 101, lowerBound = attestation.notBefore === undefined ? undefined : instant(attestation.notBefore)
+      if (truncated) must(lowerBound !== undefined)
+      let previousTimestamp = Infinity
       for (const raw of list.builds) {
         const build = object(raw)
         must(integer(build.number) && !numbers.has(build.number)); numbers.add(build.number)
-        if (source(build) === context.request.sha) matches.push(build)
+        // A 101st sentinel may establish a complete grant-era window, never uniqueness over unbounded history.
+        // Check every returned SHA, including the sentinel, to reject an invalid source-era attestation.
+        if (truncated || lowerBound !== undefined || build.timestamp !== undefined) {
+          must(integer(build.timestamp) && build.timestamp <= Date.now() && build.timestamp <= previousTimestamp)
+          previousTimestamp = build.timestamp
+        }
+        if (source(build) === context.request.sha) {
+          if (lowerBound !== undefined) must((build.timestamp as number) >= lowerBound)
+          matches.push(build)
+        }
       }
+      if (truncated) must(previousTimestamp < lowerBound!)
       const queued: Json[] = []
       for (const raw of queue.items) {
         const item = object(raw), task = object(item.task)
@@ -244,8 +264,8 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
       }
       if (!matches.length) { missing = true; continue }
       const number = matches[0]!.number as number
-      const build = await reader.get(`${jobPath(job)}/${number}/api/json?tree=number,result,building,queueId,actions[lastBuiltRevision[SHA1],parameters[name,value]]`)
-      must(build && build.number === number && integer(build.queueId) && build.queueId === matches[0]!.queueId && source(build) === context.request.sha && typeof build.building === 'boolean')
+      const build = await reader.get(`${jobPath(job)}/${number}/api/json?tree=number,timestamp,result,building,queueId,actions[lastBuiltRevision[SHA1],parameters[name,value]]`)
+      must(build && build.number === number && (matches[0]!.timestamp === undefined || (build.timestamp === matches[0]!.timestamp && (build.timestamp as number) <= Date.now())) && integer(build.queueId) && build.queueId === matches[0]!.queueId && source(build) === context.request.sha && typeof build.building === 'boolean')
       const fact: BuildFact = { job, id: `${job}:queue:${build.queueId}`,  sha: context.request.sha, destinationId: route.destinationId, state: 'unknown', healthy: false }
       if (build.building) { must(build.result === null); fact.state = 'running' }
       else if (['FAILURE', 'ABORTED', 'UNSTABLE', 'NOT_BUILT'].includes(String(build.result))) fact.state = 'failed'
@@ -270,8 +290,11 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
         : facts.some(fact => fact.state === 'unknown') ? 'unknown'
           : facts.some(fact => fact.state === 'running') ? 'running'
             : facts.some(fact => fact.state === 'queued') ? 'queued' : exactMerged ? 'succeeded' : 'unknown'
+    const awaitingWebhook = missing && exactMerged && instant(attestation.deadline) > Date.now()
+      && facts.every(fact => ['queued', 'running', 'succeeded'].includes(fact.state))
     result.deployment = { routeId: route.id, sourceSha: context.request.sha, state, ids: facts.map(fact => fact.id), destinationId: route.destinationId,
-      healthy: state === 'succeeded', remoteDeadlineEnforced: true, configSha256: { ...attestation.configSha256 }, deadline: attestation.deadline, builds: facts }
+      healthy: state === 'succeeded', remoteDeadlineEnforced: true, configSha256: { ...attestation.configSha256 }, deadline: attestation.deadline,
+      ...(awaitingWebhook ? { awaitingWebhook: true } : {}), builds: facts }
     return result
   } catch {
     // Do not leak URL query strings, credential paths, tokens or private publisher config on any failure.

@@ -29,6 +29,7 @@ export const NightConfigSchema = z.object({
   lockRoot: absolute.optional(),
   repositories: z.record(alias, absolute),
   releasePolicy: ReleasePolicySchema.optional(),
+  releaseRuntime: z.object({ keyId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/), keyFile: absolute, ticketDir: absolute, attestationFile: absolute }).strict().optional(),
   repositoryActions: z.record(alias, z.object({
     validations: z.record(alias, recipe),
     requiredValidations: z.array(alias).min(1),
@@ -86,6 +87,9 @@ export function loadNightConfig(file: string): NightConfig {
     }
     if (inside(workspace, canonicalTarget(policy.credentialFile))) throw new Error('Release credential must remain outside the Pi workspace')
     if (JSON.stringify(c.releasePolicy.freezeWindows) !== JSON.stringify(c.freezeWindows)) throw new Error('Release and shift freeze windows must be identical')
+  }
+  if (c.releaseRuntime) for (const path of [c.releaseRuntime.keyFile, c.releaseRuntime.ticketDir, c.releaseRuntime.attestationFile]) {
+    if (inside(workspace, canonicalTarget(path))) throw new Error('Release runtime material must be outside the Pi workspace')
   }
   const executable = realpathSync(c.piExecutable)
   if (!statSync(executable).isFile()) throw new Error('piExecutable is not a file')

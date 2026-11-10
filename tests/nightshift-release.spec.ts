@@ -38,6 +38,14 @@ function fixture() {
   const builds = () => { snapshot.deployment!.builds = snapshot.deployment!.ids.map((id, index) => ({ job: policy.repositories.repo!.environments.test!.jobs[index]!, id, sha: SHA, destinationId: 'test-cluster', state: snapshot.deployment!.state as 'running' | 'succeeded' | 'failed', healthy: snapshot.deployment!.healthy, artifactDigest: `sha256:${JOB}` })) }
   return { root, policy, grant, candidate, snapshot, authority, transport, path, create, request, mr, route, merged, builds, revoke: () => { authorized = false }, deactivate: () => { activeDeadline = undefined }, deadline: (value: string) => { activeDeadline = value } }
 }
+function harnessAwaiting() {
+  const h = fixture()
+  h.policy.repositories.repo!.mergeTriggersDeploy = true
+  h.policy.repositories.repo!.environments.test!.jobs.push('test-deploy-two')
+  h.policy.repositories.repo!.environments.test!.expectedConfigSha256['test-deploy-two'] = JOB
+  h.mr(); h.route(); h.snapshot.deployment!.configSha256!['test-deploy-two'] = JOB
+  return { ...h, controller: h.create() }
+}
 afterEach(async () => {
   for (const coordinator of coordinators.splice(0)) await coordinator.close()
   vi.restoreAllMocks(); vi.useRealTimers()
@@ -516,6 +524,19 @@ describe('MR, merge and observation-only deployment gates', () => {
     const result = await c.reconcile(merge.operationId!, signal())
     expect(result.status).not.toBe('succeeded')
     expect(result.remoteActive).toBe(true)
+    expect(h.transport.dispatch).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['replacement', 'disappeared', 'expired', 'unverified-merge'] as const)('rejects %s after partial webhook observation instead of forgetting pinned siblings', async fault => {
+    const h = harnessAwaiting()
+    const merge = await h.controller.execute(h.request('merge'), signal())
+    h.merged(); h.snapshot.deployment!.state = 'unknown'; h.snapshot.deployment!.ids = ['build-1']; h.builds(); h.snapshot.deployment!.builds![0]!.state = 'running'; h.snapshot.deployment!.awaitingWebhook = true
+    expect(await h.controller.reconcile(merge.operationId!, signal())).toMatchObject({ status: 'accepted', remoteActive: true })
+    if (fault === 'replacement') { h.snapshot.deployment!.ids = ['replacement']; h.snapshot.deployment!.builds![0]!.id = 'replacement' }
+    if (fault === 'disappeared') { h.snapshot.deployment!.ids = []; h.snapshot.deployment!.builds = [] }
+    if (fault === 'expired') h.snapshot.deployment!.deadline = new Date(Date.now() - 1).toISOString()
+    if (fault === 'unverified-merge') h.snapshot.mergeRequest!.mergeCommitVerified = false
+    expect(await h.controller.reconcile(merge.operationId!, signal())).toMatchObject({ status: 'unknown', remoteActive: true })
     expect(h.transport.dispatch).toHaveBeenCalledTimes(1)
   })
 
