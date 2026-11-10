@@ -144,6 +144,17 @@ export class PiRunner implements Runner {
           await safeGit(root, ['switch', '--no-guess', '--no-recurse-submodules', '-c', scope.sourceBranch, scope.baseSha], config)
         } else if (head !== scope.baseSha) throw new Error('Existing release branch is not at its admitted base')
       }
+      // A write task without a release grant still needs a scratch branch: the guard refuses edits
+      // on a human branch. This never resets, rebases or pushes; the human branch stays untouched.
+      if (task.access === 'write' && !task.releaseGrant) for (const name of task.repositories) {
+        const root = repositories[name]!
+        const branch = (await safeGit(root, ['branch', '--show-current'], config)).trim()
+        if (!/^(?:sdd|agent)\//.test(branch)) {
+          signal.throwIfAborted(); this.options.assertAuthorized?.(request)
+          const scratch = `sdd/task-${task.id.slice(0, 8)}`
+          await safeGit(root, ['switch', '--no-guess', '--no-recurse-submodules', '-c', scratch], config)
+        }
+      }
       for (const name of task.repositories) {
         baseline[name] = { head: (await safeGit(repositories[name]!, ['rev-parse', 'HEAD'], config)).trim(),
           branch: (await safeGit(repositories[name]!, ['branch', '--show-current'], config)).trim() }
