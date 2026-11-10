@@ -102,6 +102,7 @@ export class NightAdapter {
     return { enabled: this.host.config.enabled, workspace: this.host.config.workspace,
       sessionFile: this.host.config.sessionFile, repositories: Object.keys(this.host.config.repositories),
       ...(this.host.config.releasePolicy ? { releaseEnabled: this.host.config.releasePolicy.enabled,
+        releaseAllowedActions: this.host.config.releasePolicy.allowedActions ?? ['push', 'create_mr', 'merge', 'deploy'],
         releaseOperations: this.host.runner.operations?.() ?? [] } : {}),
       ...this.controller.snapshot() }
   }

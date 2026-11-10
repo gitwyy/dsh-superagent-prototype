@@ -65,6 +65,18 @@ describe('release authority and immutable evidence', () => {
     }
   })
 
+  it.each(['merge', 'deploy'] as const)('blocks operator-disabled %s even if a task grant includes it', async action => {
+    const h = fixture(); h.policy.allowedActions = ['push', 'create_mr']; const c = h.create()
+    expect((await c.execute(h.request(action), signal())).status).toBe('blocked')
+    expect(h.transport.observe).not.toHaveBeenCalled(); expect(h.transport.dispatch).not.toHaveBeenCalled()
+  })
+  it.each(['push', 'create_mr'] as const)('allows %s after parallel target advances under narrowed policy', async action => {
+    const h = fixture(); h.policy.allowedActions = ['push', 'create_mr']; h.snapshot.targetSha = 'f'.repeat(40)
+    h.snapshot.project.fastForwardOnly = false
+    if (action === 'create_mr') h.snapshot.sourceSha = SHA
+    const c = h.create(); expect((await c.execute(h.request(action), signal())).status).toBe('accepted')
+    expect(h.transport.dispatch).toHaveBeenCalledOnce()
+  })
   it('hashes policy canonically including deadlines/freeze/route identity', () => {
     const h = fixture(), reordered = { maxGrantSeconds: h.policy.maxGrantSeconds, freezeWindows: h.policy.freezeWindows, repositories: h.policy.repositories, enabled: true, version: 1 as const }
     expect(policyDigest(reordered)).toBe(policyDigest(h.policy))
@@ -112,7 +124,7 @@ describe('release authority and immutable evidence', () => {
     expect(h.transport.dispatch).not.toHaveBeenCalled()
   })
 
-  it.each(['user-id', 'username', 'project-id', 'project-path', 'branch', 'pipeline-required', 'ci', 'production', 'fingerprint', 'target'] as const)('rejects remote %s drift', async fault => {
+  it.each(['user-id', 'username', 'project-id', 'project-path', 'branch', 'pipeline-required', 'ci', 'production', 'fingerprint'] as const)('rejects remote %s drift', async fault => {
     const h = fixture(), c = h.create()
     if (fault === 'user-id') h.snapshot.identity.id++
     if (fault === 'username') h.snapshot.identity.username = 'somebody'
@@ -123,7 +135,6 @@ describe('release authority and immutable evidence', () => {
     if (fault === 'ci') h.snapshot.targetCiSha256 = '0'.repeat(64)
     if (fault === 'production') h.snapshot.productionExcluded = false
     if (fault === 'fingerprint') h.snapshot.triggerPolicyFingerprint = 'unreviewed'
-    if (fault === 'target') h.snapshot.targetSha = SHA
     expect((await c.execute(h.request(), signal())).status).toBe('blocked')
     expect(h.transport.dispatch).not.toHaveBeenCalled()
   })

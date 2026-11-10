@@ -186,7 +186,8 @@ class Controller implements NightController {
             policyDigest: policyDigest(policy), scopes: command.scopes })
           if (!parsed.success || parsed.data.scopes.some(scope => {
             const repo = policy.repositories[scope.repository]
-            return !task.repositories.includes(scope.repository) || !repo || repo.targetBranch !== scope.targetBranch
+            return (policy.allowedActions !== undefined && scope.actions.some(action => !policy.allowedActions!.includes(action)))
+              || !task.repositories.includes(scope.repository) || !repo || repo.targetBranch !== scope.targetBranch
               || (scope.environment && !repo.environments[scope.environment])
               || (repo.mergeTriggersDeploy && scope.actions.includes('merge') && (!scope.actions.includes('deploy') || !scope.environment))
               || (scope.actions.includes('deploy') && (!scope.actions.includes('merge') || !scope.environment))

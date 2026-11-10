@@ -25,7 +25,7 @@ const unique = <T>(values: T[]) => new Set(values).size === values.length
 const absolute = name.refine(isAbsolute, 'absolute host path required')
 const routeSchema = z.strictObject({ kind: z.literal('jenkins'), id: name, jobs: z.array(name).min(1).refine(unique), origin: z.url(), expectedConfigSha256: z.record(name, sha256), destinationId: name, remoteDeadlineEnforced: z.boolean(), credentialRef: name })
 const repositorySchema = z.strictObject({ alias: name, root: absolute, projectId: positive, projectPath: name, host: name, apiOrigin: z.url(), allowInsecureHttp: z.boolean().optional(), expectedUserId: positive, expectedUsername: name, credentialFile: absolute, targetBranch: branch, ciSha256: sha256, requiredJobs: z.array(name).min(1).refine(unique), mergeTriggersDeploy: z.boolean(), pushHasNoRemoteJobs: z.boolean().optional(), triggerPolicy: z.strictObject({ reviewedAt: dateTime, expiresAt: dateTime, productionExcluded: z.boolean(), fingerprint: name }), environments: z.strictObject({ test: routeSchema.optional(), preprod: routeSchema.optional() }) })
-const policySchema = z.strictObject({ version: z.literal(1), enabled: z.boolean(), repositories: z.record(name, repositorySchema), freezeWindows: z.array(z.strictObject({ from: dateTime, until: dateTime }).refine(window => Date.parse(window.until) > Date.parse(window.from))), maxGrantSeconds: positive.max(43_200) })
+const policySchema = z.strictObject({ version: z.literal(1), enabled: z.boolean(), allowedActions: z.array(action).refine(unique).optional(), repositories: z.record(name, repositorySchema), freezeWindows: z.array(z.strictObject({ from: dateTime, until: dateTime }).refine(window => Date.parse(window.until) > Date.parse(window.from))), maxGrantSeconds: positive.max(43_200) })
 const scopeSchema = z.strictObject({ repository: name, sourceBranch, targetBranch: branch, baseSha: oid, environment: environment.optional(), actions: z.array(action).min(1).refine(unique) }).refine(scope => scope.sourceBranch !== scope.targetBranch)
 const grantSchema = z.strictObject({ id: name, taskId: name, ownerId: name, approvalMessageId: name, issuedAt: dateTime, expiresAt: dateTime, policyDigest: sha256, scopes: z.array(scopeSchema).min(1).refine(scopes => unique(scopes.map(scope => scope.repository))) })
 export { policySchema as ReleasePolicySchema, scopeSchema as ReleaseScopeSchema, grantSchema as ReleaseGrantSchema }
@@ -116,6 +116,7 @@ class Coordinator implements ReleaseCoordinator {
   private active(repository?: string): boolean { return this.records().some(intent => (!repository || intent.operation.repository === repository) && intent.remoteActive) }
   private grant(request: ReleaseRequest, signal: AbortSignal, previous?: Admission): Admission {
     requireThat(!this.closing && !this.fault && !signal.aborted && this.policy.enabled, 'Release dispatch is disabled, stopping, aborted or storage-faulted')
+    requireThat(this.policy.allowedActions === undefined || this.policy.allowedActions.includes(request.action), 'This release action is temporarily disabled by the operator policy')
     const grant = grantSchema.parse(this.authority.grant(request.taskId))
     requireThat(grant.taskId === request.taskId && grant.policyDigest === this.digest && this.authority.isAuthorized(grant.ownerId) === true, 'Task owner/grant/policy authorization no longer matches')
     const time = Date.now(), issued = Date.parse(grant.issuedAt), expires = Date.parse(grant.expiresAt)
@@ -188,7 +189,7 @@ class Coordinator implements ReleaseCoordinator {
   private preconditions(snapshot: RemoteSnapshot, request: ReleaseRequest, admission: Admission, candidate: CandidateEvidence): void {
     this.common(snapshot, admission.repository)
     const { scope, repository } = admission
-    if (request.action !== 'deploy') requireThat(snapshot.targetSha === scope.baseSha, 'Target branch drifted from the explicitly admitted base')
+    if (request.action === 'merge') requireThat(snapshot.targetSha === scope.baseSha, 'Target branch drifted from the explicitly admitted base')
     if (request.action === 'push') {
       requireThat(!snapshot.sourceSha || snapshot.sourceSha === scope.baseSha, 'Remote source frontier is unrelated/already published; no overwrite, force-push or unjournaled replay allowed')
       return

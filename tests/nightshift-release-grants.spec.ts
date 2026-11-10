@@ -57,6 +57,14 @@ describe('release grant controller boundary', () => {
     expect(h.runner.run).not.toHaveBeenCalled()
   })
 
+  it('accepts push/MR scopes but refuses merge/deploy while operator action switch is narrowed', async () => {
+    const h = fixture(); h.releasePolicy.allowedActions = ['push', 'create_mr']; const c = h.create(), id = await task(c)
+    await grant(c, id, [h.scope()]); expect(c.snapshot().tasks[0]!.releaseGrant).toBeUndefined()
+    const scope = { ...h.scope(), actions: ['push', 'create_mr'] as const }
+    await grant(c, id, [{ ...scope, actions: [...scope.actions] }])
+    expect(c.snapshot().tasks[0]!.releaseGrant?.scopes[0]!.actions).toEqual(['push', 'create_mr'])
+  })
+
   it.each(['unapproved', 'read', 'stranger', 'cancelled', 'finished', 'group', 'bot', 'disabled-policy', 'disabled-night', 'no-policy'] as const)('refuses release authority for %s task/message', async invalid => {
     const h = fixture()
     if (invalid === 'disabled-policy') h.releasePolicy.enabled = false

@@ -41,6 +41,8 @@ export interface DeploymentRoute {
 export interface ReleasePolicy {
   version: 1
   enabled: boolean
+  /** Operator kill-switch by action. Omitted preserves legacy full-policy behavior; an empty list denies all. */
+  allowedActions?: ReleaseAction[]
   repositories: Record<string, ReleaseRepository>
   freezeWindows: { from: string; until: string }[]
   maxGrantSeconds: number
