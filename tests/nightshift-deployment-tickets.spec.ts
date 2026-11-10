@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createDeploymentTickets, type DeploymentEnvelope, type DeploymentTicketOptions } from '../src/nightshift/release/deployment-tickets.ts'
-import type { DispatchContext } from '../src/nightshift/release/contracts.ts'
+import type { DispatchContext, MergePlan } from '../src/nightshift/release/contracts.ts'
 
 const roots: string[] = [], SHA = 'a'.repeat(40), BASE = 'b'.repeat(40), HASH = 'c'.repeat(64), JOB = 'test/app'
 const NOW = new Date('2026-11-10T04:00:00Z')
@@ -215,6 +215,67 @@ describe('merge verification and read-only stored evidence', () => {
     await expect(h.signer.metadata(h.context)).rejects.toThrow()
     expect(calls).toBeGreaterThanOrEqual(2)
     expect(readdirSync(h.options.stateDir)).toEqual([])
+  })
+})
+
+describe('ordinary merge immutable V2 preparation', () => {
+  function ordinary() {
+    const h = fixture(), plan: MergePlan = { version: 2, sourceSha: SHA, targetSha: BASE, expectedTreeSha: 'd'.repeat(40), ciSha256: HASH, validationProfile: 'full-verify' }
+    h.context.repository.mergeMode = 'merge-commit'
+    h.context.request.action = h.context.operation.action = 'prepare_merge'
+    h.context.operation.id = 'prepare-operation'; h.context.operation.mergePlan = plan
+    const merge = (): DispatchContext => ({ ...h.context, request: { ...h.context.request, action: 'merge' }, operation: { ...h.context.operation, id: 'merge-operation', action: 'merge', preparationId: 'prepare-operation' } })
+    return { ...h, plan, merge }
+  }
+
+  it('signs exact18-field V2 payload in the legacy delimiter and binds sidecar plan+prep identity', async () => {
+    const h = ordinary(), metadata = await h.signer.metadata(h.context), ticket = envelopes(metadata)[0]!
+    expect(metadata.startsWith('<!-- superagent-deploy-v1\n')).toBe(true)
+    expect(Object.keys(ticket.payload)).toHaveLength(18)
+    expect(ticket.payload).toMatchObject({ version: 2, sourceSha: SHA, targetSha: BASE, expectedTreeSha: h.plan.expectedTreeSha, validationProfile: 'full-verify', operationId: 'prepare-operation' })
+    expect(ticket.signature).toBe(createHmac('sha256', key).update(canonical(ticket.payload)).digest('hex'))
+    await expect(h.signer.verify(h.merge(), metadata)).resolves.toBeUndefined()
+    const evidence = await h.signer.evidence('task-1', 'app', SHA)
+    expect(evidence).toMatchObject({ mergePlan: h.plan, metadata, metadataDigest: createHash('sha256').update(metadata).digest('hex'), operationId: 'prepare-operation' })
+    expect(await createDeploymentTickets(h.options).metadata(h.context)).toBe(metadata)
+    vi.setSystemTime(Date.now() + 120_000)
+    expect(await h.signer.evidence('task-1', 'app', SHA)).toEqual(evidence)
+    await expect(h.signer.metadata(h.context)).rejects.toThrow()
+  })
+
+  it('emits a V2 envelope accepted by pure Python validation only for proven actual M/full verification', async () => {
+    const h = ordinary(), tickets = envelopes(await h.signer.metadata(h.context))
+    const script = python.replace("p=ticket['payload']; ctx=g.GateContext(job=p['jobs'][0],build_id='fixture-build-1',source_sha=p['sourceSha'],project_id=p['projectId'],destination_id=p['destinationId'],environment=p['environment'],key_id=p['keyId'])", "p=ticket['payload']; ctx=g.GateContext(job=p['jobs'][0],build_id='fixture-build-1',source_sha='e'*40,project_id=p['projectId'],destination_id=p['destinationId'],environment=p['environment'],key_id=p['keyId'],approved_source_sha=p['sourceSha'],target_sha=p['targetSha'],tree_sha=p['expectedTreeSha'],parents=(p['targetSha'],p['sourceSha']),verification_source_sha='e'*40,verification_profile='full-verify',verification_passed=True)")
+    const result = JSON.parse(execFileSync('python3', ['-I', '-B', '-c', script, gate], { input: JSON.stringify({ tickets, key: key.toString('hex'), now: NOW.toISOString() }), encoding: 'utf8', timeout: 10_000 }))
+    expect(result[0]).toMatchObject({ valid: true, approvedSourceSha: SHA, deployedSha: 'e'.repeat(40) })
+  })
+
+  it.each(['create-mr', 'missing-plan', 'source', 'target', 'tree', 'ci', 'profile', 'extra', 'prep-id', 'stale-target', 'downgrade'] as const)('never replaces or re-signs a prepared ticket after %s drift', async invalid => {
+    const h = ordinary(), metadata = await h.signer.metadata(h.context)
+    if (invalid === 'create-mr') h.context.request.action = h.context.operation.action = 'create_mr'
+    if (invalid === 'missing-plan') delete h.context.operation.mergePlan
+    if (invalid === 'source') h.plan.sourceSha = 'f'.repeat(40)
+    if (invalid === 'target') h.plan.targetSha = h.context.snapshot.targetSha = 'f'.repeat(40)
+    if (invalid === 'tree') h.plan.expectedTreeSha = 'f'.repeat(40)
+    if (invalid === 'ci') h.plan.ciSha256 = 'f'.repeat(64)
+    if (invalid === 'profile') (h.plan as { validationProfile: string }).validationProfile = 'package-only'
+    if (invalid === 'extra') Object.assign(h.plan, { generation: 2 })
+    if (invalid === 'prep-id') h.context.operation.id = 'new-prepare'
+    if (invalid === 'stale-target') h.context.snapshot.targetSha = 'f'.repeat(40)
+    if (invalid === 'downgrade') delete h.context.repository.mergeMode
+    await expect(h.signer.metadata(h.context)).rejects.toThrow()
+    const files = readdirSync(h.options.stateDir)
+    expect(files).toHaveLength(1)
+    expect(JSON.parse(readFileSync(join(h.options.stateDir, files[0]!), 'utf8')).metadata).toBe(metadata)
+  })
+
+  it('rejects mismatched merge preparation IDs and sidecar tree tampering', async () => {
+    const h = ordinary(), metadata = await h.signer.metadata(h.context), context = h.merge()
+    context.operation.preparationId = 'wrong-prepare'
+    await expect(h.signer.verify(context, metadata)).rejects.toThrow()
+    const path = join(h.options.stateDir, readdirSync(h.options.stateDir)[0]!), record = JSON.parse(readFileSync(path, 'utf8'))
+    record.mergePlan.expectedTreeSha = 'f'.repeat(40); writeFileSync(path, canonical(record))
+    await expect(h.signer.evidence('task-1', 'app', SHA)).rejects.toThrow()
   })
 })
 

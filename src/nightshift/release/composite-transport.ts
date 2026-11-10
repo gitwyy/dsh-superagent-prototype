@@ -129,7 +129,10 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
     try {
       const { document, entry } = await localAttestation(context)
       const evidence = await tickets.evidence(context.request.taskId, context.request.repository, context.request.sha)
-      if (!evidence) return undefined // Before createMR, absence cannot authorize merge or fabricate a deadline.
+      if (!evidence) return undefined // Before ticket issuance, absence cannot authorize merge or fabricate a deadline.
+      const plan = evidence.mergePlan
+      must(context.repository.mergeMode === 'merge-commit' ? plan && plan.version === 2 && plan.sourceSha === context.request.sha
+        && plan.ciSha256 === context.repository.ciSha256 && plan.validationProfile === 'full-verify' : !plan)
       const route = context.repository.environments[context.scope.environment!]!
       must(evidence.policyDigest === digest && Number.isFinite(Date.parse(evidence.deadline)) && Number.isFinite(Date.parse(evidence.sourceNotBefore)) && Date.parse(evidence.sourceNotBefore) <= Date.now() && canonical(Object.keys(evidence.jobTickets).sort()) === canonical([...route.jobs].sort()))
       const grants = new Set<string>()
@@ -139,11 +142,13 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
           && payload.environment === context.scope.environment && payload.destinationId === route.destinationId && payload.keyId === runtime.keyId
           && payload.operationId === evidence.operationId && payload.expiresAt === evidence.deadline && canonical(payload.jobs) === canonical([job])
           && Date.parse(evidence.sourceNotBefore) <= Date.parse(payload.issuedAt))
+        must(plan ? payload.version === 2 && payload.targetSha === plan.targetSha && payload.expectedTreeSha === plan.expectedTreeSha
+          && payload.validationProfile === plan.validationProfile : payload.version === 1)
         grants.add(payload.grantId)
       }
       must(grants.size === 1 && Date.parse(document.expiresAt) > Date.now()); assertOpen()
       return { expiresAt: document.expiresAt, notBefore: evidence.sourceNotBefore, configSha256: { ...entry.configSha256 }, deadline: evidence.deadline, remoteDeadlineEnforced: entry.remoteDeadlineEnforced,
-        destinationId: entry.destinationId, targets: structuredClone(entry.targets) }
+        destinationId: entry.destinationId, targets: structuredClone(entry.targets), ...(plan ? { mergePlan: structuredClone(plan) } : {}) }
     } catch { return undefined }
   }
   function guarded(context: DispatchContext, document?: AttestationFile): DispatchContext {
@@ -157,7 +162,7 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
   const gitlab = (options.gitlabFactory ?? createGitlabTransport)({ tempRoot: resolve(config.stateDir, 'release-git'), fetch: options.fetch, deploymentTickets: {
     async metadata(context) {
       await bound(context)
-      if (!context.repository.mergeTriggersDeploy) return ''
+      if (!context.repository.mergeTriggersDeploy || (context.repository.mergeMode === 'merge-commit' && context.request.action === 'create_mr')) return ''
       const { document } = await localAttestation(context)
       return tickets.metadata(guarded(context, document))
     },
@@ -166,6 +171,14 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
       const { document } = await localAttestation(context)
       await tickets.verify(guarded(context, document), description)
     },
+    async evidence(taskId, repository, sha) {
+      assertOpen()
+      must(policy.repositories[repository])
+      const evidence = await tickets.evidence(taskId, repository, sha)
+      assertOpen()
+      must(!evidence || evidence.policyDigest === digest)
+      return evidence
+    },
   } })
   async function observe(context: Parameters<ReleaseTransport['observe']>[0], signal: AbortSignal) {
     await bound(context)
@@ -173,7 +186,7 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
     combined.throwIfAborted()
     const snapshot = await gitlab.observe(structuredClone(context), combined)
     combined.throwIfAborted(); assertOpen()
-    if (!context.scope.environment) return snapshot
+    if (!context.scope.environment || context.request.action === 'prepare_merge') return snapshot
     return (options.observer ?? overlayJenkinsObservation)(context, snapshot, combined, { fetch: options.fetch, attest })
   }
   function tracked<T>(operation: () => Promise<T>): Promise<T> {
@@ -182,6 +195,15 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
     return promise
   }
   const transport: ReleaseTransport = {
+    planMerge: (context, signal) => tracked(async () => {
+      const copied = structuredClone({ repository: context.repository, scope: context.scope, request: context.request, candidate: context.candidate, snapshot: context.snapshot })
+      await bound(copied)
+      const combined = AbortSignal.any([signal, lifetime.signal])
+      combined.throwIfAborted(); assertOpen(); must(gitlab.planMerge)
+      const plan = await gitlab.planMerge(copied, combined)
+      combined.throwIfAborted(); assertOpen()
+      return structuredClone(plan)
+    }),
     observe: (context, signal) => tracked(async () => observe(structuredClone({ repository: context.repository, scope: context.scope, request: context.request, ...(context.operation ? { operation: context.operation } : {}) }), signal)),
     dispatch: (context, signal) => tracked(async () => {
       // Clone all data while preserving the deliberately host-only live callback.
@@ -191,7 +213,8 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
       let next = guarded(copied)
       next.assertAuthorized(); combined.throwIfAborted()
       if (copied.request.action === 'deploy') throw new Error('Deploy is observation-only; duplicate Jenkins trigger denied')
-      if (copied.repository.mergeTriggersDeploy && copied.scope.actions.includes('merge') && copied.request.action === 'create_mr') {
+      if (copied.repository.mergeTriggersDeploy && copied.scope.actions.includes('merge')
+        && (copied.request.action === 'prepare_merge' || (copied.repository.mergeMode !== 'merge-commit' && copied.request.action === 'create_mr'))) {
         const { document } = await localAttestation(copied)
         next = guarded(copied, document)
       }
@@ -203,6 +226,13 @@ export function createReleaseServices(config: NightConfig, runtime: ReleaseRunti
           && deployment.routeId === route.id && deployment.destinationId === route.destinationId && deployment.remoteDeadlineEnforced === true
           && canonical(deployment.configSha256) === canonical(route.expectedConfigSha256) && deployment.deadline
           && Date.parse(deployment.deadline) > Date.now() && Date.parse(deployment.deadline) <= Date.parse(copied.deadline))
+        if (copied.repository.mergeMode === 'merge-commit') {
+          const plan = copied.operation.mergePlan, preparation = snapshot.preparation
+          must(plan && preparation?.verified === true && preparation.operationId === copied.operation.preparationId
+            && canonical(preparation.plan) === canonical(plan) && snapshot.sourceSha === plan.sourceSha && snapshot.targetSha === plan.targetSha
+            && snapshot.targetCiSha256 === plan.ciSha256 && Date.parse(preparation.expiresAt) > Date.now()
+            && deployment.approvedSourceSha === copied.request.sha && canonical(deployment.mergePlan) === canonical(plan))
+        }
         next = guarded({ ...copied, snapshot }, document)
       }
       next.assertAuthorized(); combined.throwIfAborted()

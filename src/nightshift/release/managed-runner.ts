@@ -6,6 +6,7 @@ import { createPiRunner, type PiRunnerOptions } from '../pi-runner.ts'
 import { CommitReceipts } from './receipts.ts'
 import { createReleaseCoordinator, type ReleaseCoordinator } from './coordinator.ts'
 import { createGitlabTransport } from './gitlab.ts'
+import { assertMergeProcessesStopped } from './merge-objects.ts'
 import { createReleaseServices, type ReleaseServices } from './composite-transport.ts'
 import type { ReleaseTransport, ReleaseResult, ReleaseOperation } from './contracts.ts'
 
@@ -53,7 +54,16 @@ export function createManagedRunner(config: NightConfig, host: ManagedRunnerHost
     remoteActive: id => release?.remoteActive(id) ?? false,
     release: async (request, input, signal) => {
       if (!release || !config.releasePolicy?.enabled) return { status: 'blocked', detail: 'Host release policy is not enabled', remoteIds: [], remoteActive: false }
-      const prior = release.operations(request.task.id).find(op => op.repository === input.repository && op.sha === input.sha && op.action === input.action)
+      const grantId = task(request.task.id)?.releaseGrant?.id
+      const prior = release.operations(request.task.id).find(op => op.grantId === grantId && op.repository === input.repository && op.sha === input.sha && op.action === input.action)
+      if (!prior && input.action === 'merge' && config.releasePolicy.repositories[input.repository]?.mergeMode === 'merge-commit') {
+        // Metadata publication and merge are separate durable operations. One immutable preparation only;
+        // a target race or ambiguous metadata response returns without re-planning, re-signing or merging.
+        let preparation = await release.prepareMerge({ taskId: request.task.id, repository: input.repository, sha: input.sha }, signal)
+        if (preparation.status === 'unknown') return preparation // Only an explicit host reconciliation may clear an ambiguous metadata write.
+        if (preparation.operationId && ['accepted', 'succeeded'].includes(preparation.status)) preparation = await release.reconcile(preparation.operationId, signal)
+        if (preparation.status !== 'succeeded' || preparation.remoteActive || signal.aborted) return preparation
+      }
       let result = prior ? await release.reconcile(prior.id, signal) : await release.execute({ ...input, taskId: request.task.id }, signal)
       if (result.operationId && result.status === 'accepted') result = await release.reconcile(result.operationId, signal)
       // Managed wait is read-only; accepted mutations are never resent. Keep waiting off the LLM turn loop.
@@ -69,7 +79,12 @@ export function createManagedRunner(config: NightConfig, host: ManagedRunnerHost
   })
   let closed = false
   return {
-    preflight: (c: NightConfig, tasks: Task[]) => runner.preflight(c, tasks),
+    preflight: async (c: NightConfig, tasks: Task[]) => {
+      const result = await runner.preflight(c, tasks)
+      try { await assertMergeProcessesStopped(resolve(config.stateDir, 'release-git')) }
+      catch { result.problems.push('Unverified local merge-object writer requires manual recovery; release safety marker is retained'); result.ok = false }
+      return result
+    },
     async run(request: RunRequest, signal: AbortSignal): Promise<RunResult> {
       if (closed || active.size) return { outcome: 'blocked', summary: 'Managed runner is closed or busy', writerStopped: active.size === 0, evidence: [] }
       active.set(request.task.id, request)

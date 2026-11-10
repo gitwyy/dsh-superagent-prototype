@@ -2,7 +2,7 @@
 import { constants } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
-import { releaseMarker, type DeploymentRoute, type ReleaseRepository, type ReleaseRequest, type ReleaseScope, type RemoteSnapshot } from './contracts.ts'
+import { releaseMarker, type DeploymentRoute, type MergePlan, type ReleaseRepository, type ReleaseRequest, type ReleaseScope, type RemoteSnapshot } from './contracts.ts'
 
 export interface JenkinsObservationContext { repository: ReleaseRepository; scope: ReleaseScope; request: ReleaseRequest }
 export type JenkinsAttestedTarget =
@@ -18,6 +18,8 @@ export interface JenkinsDeploymentAttestation {
   remoteDeadlineEnforced: boolean
   destinationId: string
   targets: Record<string, JenkinsAttestedTarget>
+  /** Exact V2 plan read from authenticated immutable private ticket evidence, never Jenkins input. */
+  mergePlan?: MergePlan
 }
 export interface JenkinsObserverOptions {
   attest?: (context: JenkinsObservationContext) => JenkinsDeploymentAttestation | undefined | Promise<JenkinsDeploymentAttestation | undefined>
@@ -167,13 +169,29 @@ function webIdentity(value: Json, context: JenkinsObservationContext, target: Ex
   must(value.service === target.service && value.source === context.request.sha && value.patch_attempted === true && value.stage === 'runtime-verification'
     && config.uid === target.config.uid && config.sha256 === target.config.sha256 && text(config.resource_version))
 }
-async function verifyArtifacts(reader: JenkinsReader, context: JenkinsObservationContext, target: JenkinsAttestedTarget, job: string, number: number, origin: string): Promise<string> {
+async function verifyArtifacts(reader: JenkinsReader, context: JenkinsObservationContext, target: JenkinsAttestedTarget, job: string, number: number, origin: string, plan?: MergePlan): Promise<string> {
   const path = `${jobPath(job)}/${number}`
   const release = await reader.get(`${path}/artifact/jenkins-evidence/release.json`, true)
   const attempt = await reader.get(`${path}/artifact/jenkins-evidence/attempt.json`, true)
   must(release && attempt)
   const artifactDigest = healthyRelease(release)
+  if (plan) {
+    const verification = await reader.get(`${path}/artifact/jenkins-evidence/nightshift-merge-verification.json`, true)
+    must(verification && exactKeys(verification, ['version', 'sourceSha', 'deployedSha', 'targetSha', 'treeSha', 'parents', 'profile', 'passed'])
+      && verification.version === 2 && verification.sourceSha === plan.sourceSha && verification.deployedSha === context.request.sha
+      && verification.targetSha === plan.targetSha && verification.treeSha === plan.expectedTreeSha
+      && Array.isArray(verification.parents) && verification.parents.length === 2 && verification.parents[0] === plan.targetSha && verification.parents[1] === plan.sourceSha
+      && verification.profile === 'full-verify' && verification.passed === true)
+  }
   if (target.kind === 'java') {
+    if (plan) {
+      // Existing trusted publisher audit schema: full-profile actual-M binding is supplied by the separate merge verification artifact.
+      const audit = await reader.get(`${path}/artifact/jenkins-evidence/test-audit.json`, true)
+      must(audit && exactKeys(audit, ['tests', 'skipped', 'failures', 'errors', 'core_executed', 'reason']) && integer(audit.tests)
+        && Number.isSafeInteger(audit.skipped) && Number(audit.skipped) >= 0 && Number(audit.skipped) < Number(audit.tests)
+        && audit.failures === 0 && audit.errors === 0 && integer(audit.core_executed)
+        && audit.core_executed <= Number(audit.tests) - Number(audit.skipped) && audit.reason === null)
+    }
     javaIdentity(release, context, target, job, number, origin); javaIdentity(attempt, context, target, job, number, origin)
     must(attempt.result === 'ready' && attempt.image === release.image && text(release.before_image) && text(release.health_basis))
     if (target.publisherFingerprint) {
@@ -188,7 +206,7 @@ async function verifyArtifacts(reader: JenkinsReader, context: JenkinsObservatio
     webIdentity(release, context, target)
     must(attempt.service === target.service && attempt.source === context.request.sha && attempt.result === 'ready' && attempt.cleanup === true
       && attempt.possible_partial_update === false && text(attempt.branch) && (target.branch === undefined || attempt.branch === target.branch)
-      && text(attempt.profile) && (target.profile === undefined || attempt.profile === target.profile) && attempt.url === target.sourceUrl && (text(attempt.attempt) || integer(attempt.attempt)))
+      && text(attempt.profile) && (plan ? attempt.profile === 'full-verify' : target.profile === undefined || attempt.profile === target.profile) && attempt.url === target.sourceUrl && (text(attempt.attempt) || integer(attempt.attempt)))
     const nested = object(attempt.release), audit = object(attempt.audit), imageInputs = object(attempt.image_inputs)
     webIdentity(nested, context, target)
     must(healthyRelease(nested) === artifactDigest && nested.generation === release.generation && JSON.stringify(nested.pods) === JSON.stringify(release.pods)
@@ -198,6 +216,9 @@ async function verifyArtifacts(reader: JenkinsReader, context: JenkinsObservatio
       && ['build-only', 'full-verify'].includes(String(audit.profile)) && audit.tests_executed === (audit.profile === 'full-verify') && hash(audit.config_sha256)
       && (target.buildConfigSha256 === undefined || audit.config_sha256 === target.buildConfigSha256)
       && imageInputs.source === context.request.sha)
+    // The trusted merge artifact is emitted only after publisher config_digest/public_build + exact-M command checks.
+    // An optional operator pin still applies above; historical human build-only profile cannot downgrade a bot merge.
+    if (plan) must(audit.profile === 'full-verify' && audit.tests_executed === true)
   }
   return artifactDigest
 }
@@ -206,7 +227,11 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
   context = structuredClone(context)
   const result = structuredClone(gitlabSnapshot), route = context.scope.environment && context.repository.environments[context.scope.environment]
   if (!route) { delete result.deployment; return result }
-  const unknown = (): RemoteSnapshot => ({ ...result, deployment: { routeId: route.id, sourceSha: context.request.sha, state: 'unknown', ids: [], destinationId: route.destinationId, healthy: false, remoteDeadlineEnforced: false } })
+  let observedSha = context.request.sha, plan: MergePlan | undefined
+  const ordinary = context.repository.mergeMode === 'merge-commit'
+  const unknown = (): RemoteSnapshot => ({ ...result, deployment: { routeId: route.id, sourceSha: observedSha,
+    ...(ordinary ? { approvedSourceSha: context.request.sha, ...(plan ? { mergePlan: structuredClone(plan) } : {}) } : {}),
+    state: 'unknown', ids: [], destinationId: route.destinationId, healthy: false, remoteDeadlineEnforced: false } })
   try {
     must(['test', 'preprod'].includes(context.scope.environment!) && context.repository.alias === context.scope.repository && context.request.repository === context.scope.repository && sha(context.request.sha)
       && route.kind === 'jenkins' && route.jobs.length > 0 && route.jobs.length <= 100 && new Set(route.jobs).size === route.jobs.length)
@@ -216,6 +241,26 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
     must(options.attest)
     const attestation = structuredClone(await options.attest(structuredClone(context)))
     must(attestation); validateAttestation(attestation, route)
+    plan = attestation.mergePlan
+    must(ordinary ? plan && exactKeys(object(plan), ['version', 'sourceSha', 'targetSha', 'expectedTreeSha', 'ciSha256', 'validationProfile'])
+      && plan.version === 2 && plan.sourceSha === context.request.sha && sha(plan.targetSha) && sha(plan.expectedTreeSha) && plan.targetSha !== plan.sourceSha
+      && hash(plan.ciSha256) && plan.ciSha256 === context.repository.ciSha256 && plan.validationProfile === 'full-verify'
+      && attestation.notBefore !== undefined : !plan)
+    const mr = result.mergeRequest
+    const exactIdentity = mr?.sha === context.request.sha && mr.sourceBranch === context.scope.sourceBranch && mr.targetBranch === context.scope.targetBranch
+      && mr.sourceProjectId === context.repository.projectId && mr.targetProjectId === context.repository.projectId && mr.authorId === context.repository.expectedUserId
+      && mr.marker === releaseMarker(context.request.taskId, context.request.repository, context.request.sha)
+    const exactOpen = exactIdentity && mr?.state === 'opened' && (!plan || (result.sourceSha === plan.sourceSha && result.targetSha === plan.targetSha))
+    const exactMerged = exactIdentity && mr?.state === 'merged' && mr.mergeCommitVerified === true && (plan
+      ? sha(mr.mergeCommitSha) && mr.mergeCommitSha !== plan.sourceSha && mr.mergeCommitSha !== plan.targetSha && result.targetSha === mr.mergeCommitSha
+        && mr.mergeTreeSha === plan.expectedTreeSha && mr.mergeParents?.length === 2 && mr.mergeParents[0] === plan.targetSha && mr.mergeParents[1] === plan.sourceSha
+      : mr.mergeCommitSha === context.request.sha && result.targetSha === context.request.sha)
+    if (ordinary) {
+      must(exactOpen || exactMerged)
+      if (exactMerged) observedSha = mr!.mergeCommitSha!
+    }
+    // Artifacts, Jenkins queue and build facts use actual M only after authenticated parent/tree proof, never signed S.
+    const artifactContext = { ...context, request: { ...context.request, sha: observedSha } }
     signal.throwIfAborted()
     const reader = new JenkinsReader(route.origin, await credential(route.credentialRef), signal, options)
     const queue = await reader.get('/queue/api/json?tree=items[id,task[name,fullName],actions[parameters[name,value]]]{0,101}')
@@ -239,7 +284,7 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
           must(integer(build.timestamp) && build.timestamp <= Date.now() && build.timestamp <= previousTimestamp)
           previousTimestamp = build.timestamp
         }
-        if (source(build) === context.request.sha) {
+        if (source(build) === observedSha) {
           if (lowerBound !== undefined) must((build.timestamp as number) >= lowerBound)
           matches.push(build)
         }
@@ -255,35 +300,27 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
           continue
         }
         must(integer(item.id))
-        if (source(item) === context.request.sha) queued.push(item)
+        if (source(item) === observedSha) queued.push(item)
         else if (!source(item)) must(false) // An unidentifiable job in flight cannot establish absence.
       }
       must(matches.length <= 1 && queued.length <= 1 && !(matches.length && queued.length))
       if (queued.length) {
-        facts.push({ job, id: `${job}:queue:${queued[0]!.id}`, sha: context.request.sha, destinationId: route.destinationId, state: 'queued', healthy: false }); continue
+        facts.push({ job, id: `${job}:queue:${queued[0]!.id}`, sha: observedSha, destinationId: route.destinationId, state: 'queued', healthy: false }); continue
       }
       if (!matches.length) { missing = true; continue }
       const number = matches[0]!.number as number
       const build = await reader.get(`${jobPath(job)}/${number}/api/json?tree=number,timestamp,result,building,queueId,actions[lastBuiltRevision[SHA1],parameters[name,value]]`)
-      must(build && build.number === number && (matches[0]!.timestamp === undefined || (build.timestamp === matches[0]!.timestamp && (build.timestamp as number) <= Date.now())) && integer(build.queueId) && build.queueId === matches[0]!.queueId && source(build) === context.request.sha && typeof build.building === 'boolean')
-      const fact: BuildFact = { job, id: `${job}:queue:${build.queueId}`,  sha: context.request.sha, destinationId: route.destinationId, state: 'unknown', healthy: false }
+      must(build && build.number === number && (matches[0]!.timestamp === undefined || (build.timestamp === matches[0]!.timestamp && (build.timestamp as number) <= Date.now())) && integer(build.queueId) && build.queueId === matches[0]!.queueId && source(build) === observedSha && typeof build.building === 'boolean')
+      const fact: BuildFact = { job, id: `${job}:queue:${build.queueId}`, sha: observedSha, destinationId: route.destinationId, state: 'unknown', healthy: false }
       if (build.building) { must(build.result === null); fact.state = 'running' }
       else if (['FAILURE', 'ABORTED', 'UNSTABLE', 'NOT_BUILT'].includes(String(build.result))) fact.state = 'failed'
       else if (build.result === 'SUCCESS') {
-        fact.artifactDigest = await verifyArtifacts(reader, context, attestation.targets[job]!, job, number, route.origin)
+        fact.artifactDigest = await verifyArtifacts(reader, artifactContext, attestation.targets[job]!, job, number, route.origin, plan)
         fact.state = 'succeeded'; fact.healthy = true
       }
       facts.push(fact)
     }
     validateAttestation(attestation, route); signal.throwIfAborted()
-    const mr = result.mergeRequest
-    const exactOpen = mr?.state === 'opened' && mr.sha === context.request.sha && mr.sourceBranch === context.scope.sourceBranch && mr.targetBranch === context.scope.targetBranch
-      && mr.sourceProjectId === context.repository.projectId && mr.targetProjectId === context.repository.projectId && mr.authorId === context.repository.expectedUserId
-      && mr.marker === releaseMarker(context.request.taskId, context.request.repository, context.request.sha)
-    const exactMerged = mr?.state === 'merged' && mr.sha === context.request.sha && mr.sourceBranch === context.scope.sourceBranch && mr.targetBranch === context.scope.targetBranch
-      && mr.sourceProjectId === context.repository.projectId && mr.targetProjectId === context.repository.projectId && mr.authorId === context.repository.expectedUserId
-      && mr.marker === releaseMarker(context.request.taskId, context.request.repository, context.request.sha) && mr.mergeCommitSha === context.request.sha
-      && mr.mergeCommitVerified === true && result.targetSha === context.request.sha
     const state: Deployment['state'] = missing
       ? facts.length === 0 && exactOpen ? 'absent' : 'unknown'
       : facts.some(fact => fact.state === 'failed') ? 'failed'
@@ -292,8 +329,10 @@ export async function overlayJenkinsObservation(context: JenkinsObservationConte
             : facts.some(fact => fact.state === 'queued') ? 'queued' : exactMerged ? 'succeeded' : 'unknown'
     const awaitingWebhook = missing && exactMerged && instant(attestation.deadline) > Date.now()
       && facts.every(fact => ['queued', 'running', 'succeeded'].includes(fact.state))
-    result.deployment = { routeId: route.id, sourceSha: context.request.sha, state, ids: facts.map(fact => fact.id), destinationId: route.destinationId,
+    result.deployment = { routeId: route.id, sourceSha: observedSha, state, ids: facts.map(fact => fact.id), destinationId: route.destinationId,
       healthy: state === 'succeeded', remoteDeadlineEnforced: true, configSha256: { ...attestation.configSha256 }, deadline: attestation.deadline,
+      ...(plan ? { approvedSourceSha: context.request.sha, mergePlan: structuredClone(plan),
+        ...(state === 'succeeded' ? { fullVerification: { sha: observedSha, treeSha: plan.expectedTreeSha, profile: 'full-verify' as const, passed: true } } : {}) } : {}),
       ...(awaitingWebhook ? { awaitingWebhook: true } : {}), builds: facts }
     return result
   } catch {

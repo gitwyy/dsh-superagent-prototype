@@ -1,7 +1,18 @@
 /** Host-owned release capability. All identities/routes come from local operator policy, never Pi arguments. */
 export const releaseMarker = (taskId: string, repository: string, sha: string): string => `nightshift:${taskId}:${repository}:${sha}`
 export type ReleaseAction = 'push' | 'create_mr' | 'merge' | 'deploy'
+/** Internal metadata write authorized by merge grant, never an additional public tool capability. */
+export type ReleaseOperationAction = ReleaseAction | 'prepare_merge'
 export type ReleaseEnvironment = 'test' | 'preprod'
+/** Immutable ordinary-merge plan; source lineage base is separate from the fresh target parent. */
+export interface MergePlan {
+  version: 2
+  sourceSha: string
+  targetSha: string
+  expectedTreeSha: string
+  ciSha256: string
+  validationProfile: 'full-verify'
+}
 export interface ReleaseRepository {
   alias: string
   root: string
@@ -15,6 +26,8 @@ export interface ReleaseRepository {
   expectedUsername: string
   credentialFile: string
   targetBranch: string
+  /** Legacy FF tickets stay distinct; ordinary merges need a prepared parents/tree receipt and bot full verification. */
+  mergeMode?: 'ff' | 'merge-commit'
   /** Exact reviewed CI config blob SHA256 at candidate AND target; any drift blocks remote triggers. */
   ciSha256: string
   requiredJobs: string[]
@@ -69,7 +82,7 @@ export interface ReleaseGrant {
 export interface ReleaseRequest {
   taskId: string
   repository: string
-  action: ReleaseAction
+  action: ReleaseOperationAction
   /** Content identity required on every request; sourceBranch itself is not immutable. */
   sha: string
   title?: string
@@ -92,15 +105,16 @@ export interface CandidateEvidence {
 }
 export interface RemoteSnapshot {
   identity: { id: number; username: string }
-  project: { id: number; path: string; defaultBranch: string; pipelineRequired: boolean; fastForwardOnly?: boolean }
+  project: { id: number; path: string; defaultBranch: string; pipelineRequired: boolean; fastForwardOnly?: boolean; mergeMethod?: 'ff' | 'merge' | 'rebase_merge' }
   sourceSha?: string
   targetSha: string
   targetCiSha256: string
   productionExcluded: boolean
   triggerPolicyFingerprint: string
   mergeRequest?: { iid: number; sourceProjectId: number; targetProjectId: number; sourceBranch: string; targetBranch: string; sha: string; state: 'opened' | 'merged' | 'closed'; authorId: number; draft: boolean; conflicts: boolean; mergeable: boolean; approved: boolean; unresolvedDiscussions: number; mergeCommitSha?: string; mergeCommitVerified?: boolean; mergeTreeSha?: string; mergeParents?: string[]; marker: string }
+  preparation?: { plan: MergePlan; metadataDigest: string; operationId: string; expiresAt: string; verified: boolean }
   pipeline?: { id: number; sha: string; status: string; jobs: { name: string; status: string; allowFailure: boolean }[] }
-  deployment?: { routeId: string; sourceSha: string; state: 'absent' | 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; ids: string[]; destinationId: string; artifactDigest?: string; healthy: boolean; remoteDeadlineEnforced: boolean; configSha256?: Record<string, string>; deadline?: string; awaitingWebhook?: boolean; builds?: { job: string; id: string; sha: string; destinationId: string; state: 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; artifactDigest?: string; healthy: boolean }[] }
+  deployment?: { routeId: string; sourceSha: string; approvedSourceSha?: string; mergePlan?: MergePlan; fullVerification?: { sha: string; treeSha: string; profile: 'full-verify'; passed: boolean }; state: 'absent' | 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; ids: string[]; destinationId: string; artifactDigest?: string; healthy: boolean; remoteDeadlineEnforced: boolean; configSha256?: Record<string, string>; deadline?: string; awaitingWebhook?: boolean; builds?: { job: string; id: string; sha: string; destinationId: string; state: 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown'; artifactDigest?: string; healthy: boolean }[] }
 }
 export interface ReleaseOperation {
   id: string
@@ -108,8 +122,11 @@ export interface ReleaseOperation {
   grantId: string
   taskId: string
   repository: string
-  action: ReleaseAction
+  action: ReleaseOperationAction
   sha: string
+  /** Prepared immutable parents/tree for ordinary merge; preparation operation remains separately journaled. */
+  mergePlan?: MergePlan
+  preparationId?: string
   policyDigest: string
   state: 'prepared' | 'dispatching' | 'accepted' | 'succeeded' | 'failed' | 'unknown'
   createdAt: string
@@ -133,6 +150,8 @@ export interface DispatchContext {
 export interface ReleaseTransport {
   /** GET/read-only only. Must authenticate the same exact identity used by dispatch. No secrets in results. */
   observe(context: { repository: ReleaseRepository; scope: ReleaseScope; request: ReleaseRequest; operation?: ReleaseOperation }, signal: AbortSignal): Promise<RemoteSnapshot>
+  /** Host-only pure Git-object merge preparation. No checkout/branch/ref mutation or remote writes. */
+  planMerge?(context: { repository: ReleaseRepository; scope: ReleaseScope; request: ReleaseRequest; candidate: CandidateEvidence; snapshot: RemoteSnapshot }, signal: AbortSignal): Promise<MergePlan>
   /** Exactly one external mutation; no automatic retry. Accepted is not completed. */
   dispatch(context: DispatchContext, signal: AbortSignal): Promise<{ remoteIds: string[]; detail: string }>
 }

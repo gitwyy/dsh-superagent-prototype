@@ -2,7 +2,7 @@
 
 ## Authorized scope
 
-The operator approved the existing 17 Mate v2 aliases, task-level preauthorization for push/create MR/merge/non-production deployment, 30-day project bots, and fast-forward-only merge settings. Production remains prohibited. The existing freeze is retained: 2026-11-12 00:00 through 2026-11-14 00:00 Asia/Shanghai.
+The operator approved the existing 17 Mate v2 aliases, task-level preauthorization for push/create MR/merge/non-production deployment and 30-day project bots. Following parallel-development feedback, all17 projects use ordinary Merge commits again; project-wide FF-only is no longer required. Production remains prohibited. The existing freeze is retained: 2026-11-12 00:00 through 2026-11-14 00:00 Asia/Shanghai.
 
 **Deployment already exists:** merging master triggers the existing Jenkins webhook builds. `deploy` here means adopting/observing those exact builds. It does not POST a second Jenkins build, automatically retry, cancel unrelated jobs, or invent a new delivery pipeline.
 
@@ -37,9 +37,13 @@ These are cooperative process/tool boundaries, **not an OS sandbox**. Same-user 
 - Default transport is HTTPS. The operator explicitly accepted internal HTTP only for the company GitLab host; redirects and TLS-verification disabling are not permitted.
 - Push exports checked local objects to a host-private bare repository, ignoring checkout transport/config/hooks/alternates; one exact nonforce SHA refspec, no tags or deletion.
 - MR creation uses a stable host marker, exact source/target, and refuses conflicting/unowned MRs.
-- Merge requires server-enforced FF-only, current exact target base/source SHA, successful required MR pipeline/jobs, approvals and resolved discussions. No auto-merge, squash, rebase or force-push fallback.
+- Source lineage base is independent of the current target. Push/MR do not demand target==base. Ordinary merge requires successful exact-source MR CI/jobs, approvals and resolved discussions; no auto-merge, squash, rebase or force push.
+- An internal separately journaled `prepare_merge` computes current target T plus source S into expected tree E without checkout mutation. One immutable preparation is signed/published after source CI, then read back before one merge PUT. The user still grants only the four public actions; preparation requires the merge grant (and deploy for applications).
+- GitLab provides source SHA CAS, not target CAS. Recheck T before sending; if a race yields actual merge M with different ordered parents `[T,S]` or tree E, no bot deployment may proceed. Never automatically replace a preparation, re-sign, retry merge or trigger another Jenkins build.
+- Actual M differs from S and is verified from authenticated immutable Git objects. For V2 application builds only, existing Jenkins uses full-verify on M before image/deploy. Failed configured tests leave an already-merged branch with no successful deployment; there is no automatic main-branch rollback.
 - Every side effect is journaled as prepared then dispatching before sending; acceptance is not completion. Interrupted/ambiguous results become unknown and never auto-retry.
 - Readback verifies the actual merged SHA/tree and exact sibling Jenkins job→build→source SHA→destination/config/artifact digest/health evidence. Missing or changed evidence remains active/unknown.
+- A succeeded operation with `remoteActive=false` is a sealed historical completion receipt, not an assertion that its version remains the current deployment forever. Later master advances cannot turn that completed operation into a new active failure. New mutation/adoption still requires fresh current-head evidence.
 - Local Pi exit does not mean remote CI/deployment stopped. The controller refuses safe handoff while remote effects are active/unknown. Generic recovery cannot bypass the release journal.
 
 ## Jenkins write-window gate
@@ -56,7 +60,7 @@ Preauthorized release branches are created only at the exact admitted base SHA. 
 
 ## Provisioning and rollback
 
-`scripts/provision-nightshift-release.py` performs only project-token creation and `merge_method=ff` changes using the operator's existing authenticated CLI. It does not call auth login, modify personal keychain state, push code, create/merge MR, or trigger builds. It records before/after settings and token IDs in a private 0700 directory; secrets use 0600 files and never stdout. Interrupted provisioning requires read-only reconciliation, not duplicate token creation.
+`scripts/provision-nightshift-release.py` is the HISTORICAL initial provisioner that created tokens and set `merge_method=ff`; do not rerun it to configure the current ordinary-merge policy. Ordinary-merge migration restored `merge_method=merge` only, without changing tokens/protection/CI. It does not call auth login, modify personal keychain state, push code, create/merge MR, or trigger builds. It records before/after settings and token IDs in a private 0700 directory; secrets use 0600 files and never stdout. Interrupted provisioning requires read-only reconciliation, not duplicate token creation.
 
 The current 17 project tokens are Maintainer(40), scopes `api` and `write_repository`, expiring 2026-12-10. Those are project-scoped, not group/instance administrator grants. Runtime policy still denies direct protected-target push and out-of-scope actions regardless of token capability.
 

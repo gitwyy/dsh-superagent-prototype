@@ -14,12 +14,18 @@ export interface ReleaseIntent {
   scope: ReleaseScope
   candidate: CandidateEvidence
   deadline: string
+  /** Immutable readback pin for a successful metadata-only preparation. */
+  preparationDigest?: string
+  preparationExpiresAt?: string
+  /** Once learned, deployed commit M must never change for this logical source-S operation. */
+  mergedSha?: string
   /** Side effects can remain active even when an individual push/MR operation has succeeded. */
   remoteActive: boolean
   /** Pin webhook-created sibling build identities on first observation, never adopt a retry silently. */
   deploymentIds?: string[]
   deploymentBuilds?: Record<string, string>
 }
+const LOCAL_WRITER_KEY = '__local_writer_unknown__'
 const timestamp = () => new Date().toISOString()
 function syncDirectory(path: string): void {
   const fd = openSync(path, constants.O_RDONLY)
@@ -52,7 +58,8 @@ export class ReleaseJournal {
       db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;')
       const version = Number(db.prepare('PRAGMA user_version').get()?.user_version)
       if (version !== 0 && version !== 1) throw new Error(`Unsupported release journal version ${version}`)
-      db.exec(`CREATE TABLE IF NOT EXISTS operation (id TEXT PRIMARY KEY, logical_key TEXT NOT NULL UNIQUE, value TEXT NOT NULL); PRAGMA user_version=1;`)
+      db.exec(`CREATE TABLE IF NOT EXISTS operation (id TEXT PRIMARY KEY, logical_key TEXT NOT NULL UNIQUE, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS safety (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=1;`)
       this.db = db
       this.atomic(() => {
         for (const intent of this.intents()) {
@@ -95,6 +102,7 @@ export class ReleaseJournal {
     if (!row) return undefined
     const intent = JSON.parse(String(row.value)) as ReleaseIntent
     if (!intent.operation || typeof intent.operation.id !== 'string' || typeof intent.operation.logicalKey !== 'string'
+      || !['push', 'create_mr', 'prepare_merge', 'merge', 'deploy'].includes(intent.operation.action)
       || !['prepared', 'dispatching', 'accepted', 'succeeded', 'failed', 'unknown'].includes(intent.operation.state)
       || typeof intent.remoteActive !== 'boolean' || !intent.request || !intent.grant || !intent.scope || !intent.repository) {
       throw new Error('Invalid persisted release intent; offline reconciliation required')
@@ -106,12 +114,21 @@ export class ReleaseJournal {
   byKey(key: string): ReleaseIntent | undefined { return this.decode(this.db.prepare('SELECT value FROM operation WHERE logical_key=?').get(key)) }
   insert(intent: ReleaseIntent): void {
     this.assertOwned()
+    const operation = intent.operation
+    if (this.intents().some(row => row.operation.taskId === operation.taskId && row.operation.grantId === operation.grantId
+      && row.operation.repository === operation.repository && row.operation.sha === operation.sha && row.operation.action === operation.action)) {
+      throw new Error('Release action already has an immutable task/grant/source intent; no new generation allowed')
+    }
     this.db.prepare('INSERT INTO operation(id,logical_key,value) VALUES(?,?,?)').run(intent.operation.id, intent.operation.logicalKey, JSON.stringify(intent))
   }
   save(intent: ReleaseIntent): void {
     this.assertOwned()
     const changed = this.db.prepare('UPDATE operation SET value=? WHERE id=? AND logical_key=?').run(JSON.stringify(intent), intent.operation.id, intent.operation.logicalKey)
     if (Number(changed.changes) !== 1) throw new Error('Release journal lost immutable operation identity')
+  }
+  localWriterUnknown(): boolean { return !!this.db.prepare('SELECT 1 FROM safety WHERE key=?').get(LOCAL_WRITER_KEY) }
+  markLocalWriterUnknown(): void {
+    this.atomic(() => { this.db.prepare('INSERT OR IGNORE INTO safety(key,value) VALUES(?,?)').run(LOCAL_WRITER_KEY, timestamp()) })
   }
   close(): void {
     if (this.closed) return

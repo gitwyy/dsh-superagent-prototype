@@ -12,6 +12,15 @@ the actual existing deployment write boundary and consumes the ticket once.
 Key/read-token mounts must never reach source, Maven/npm or image-build workers.
 Controller/deploy are trusted same-UID principals; this is NOT an OS sandbox.
 Admission cannot cancel a write after it starts. See nightshift-gate.py limits.
+
+V2 tickets approve S/T/tree E, not the unknown future merge commit M. prepare()
+checks authenticated GitLab commit M parent_ids=[T,S]; GitLab commit API has NO
+trusted tree_id field. Exact tree proof and full-verify audit for M are mandatory
+at admission, supplied by trusted fixed-git/local-object + audit code, never by
+model/build parameters. V2 preparation only reports proofPending, not test success.
+The generator must force full-verify and bind the actual M audit to immutable
+commit_proof before patch. Admission returns mergeVerification evidence only after
+signature, local proof, full verification and single-use admission all succeed.
 """
 from __future__ import annotations
 
@@ -34,7 +43,7 @@ ROUTES = ROOT / 'routes.json'
 KEY = ROOT / 'signing.key'
 STATE = ROOT / 'replay'
 PREPARED = ROOT / 'prepared'
-GATE_SHA256 = '2eb196b35bf985e30b0b602f999285829b347ecdb6bc45eae2f8ca9dba78e316'
+GATE_SHA256 = '319878487367c209dbc80532fe46354dd05e1bcc1bbb5243409513e96fc01388'
 BOT_IDS = frozenset(range(95, 112))
 BLOCK_OPEN = '<!-- superagent-deploy-v1\n'
 BLOCK_CLOSE = '\n-->'
@@ -161,7 +170,9 @@ def envelope_from_description(description, context):
     require(len(set(jobs)) == len(jobs) and jobs.count(context['job']) == 1, 'ambiguous_job_ticket')
     ticket = envelopes[jobs.index(context['job'])]
     payload = ticket['payload']
-    marker = 'nightshift:' + str(payload.get('taskId', '')) + ':' + context['projectPath'].rsplit('/', 1)[-1] + ':' + context['sourceSha']
+    marker_sha = payload.get('sourceSha') if payload.get('version') == 2 else context['sourceSha']
+    require(type(marker_sha) is str and SHA.fullmatch(marker_sha), 'invalid_marker_source')
+    marker = 'nightshift:' + str(payload.get('taskId', '')) + ':' + context['projectPath'].rsplit('/', 1)[-1] + ':' + marker_sha
     markers = re.findall(r'nightshift:[A-Za-z0-9._:-]+:[A-Za-z0-9_-]+:[0-9a-f]{40}', description)
     require(markers == [marker], 'mr_marker_mismatch')
     return ticket
@@ -205,11 +216,28 @@ def prepare(env, *, trusted_target=None, routes_file=ROUTES, getter=api_get, now
     matches = [mr for mr in associated if mr.get('author', {}).get('id') == context['actorId'] and mr.get('state') == 'merged' and mr.get('merge_commit_sha') == context['sourceSha']]
     require(len(matches) == 1 and type(matches[0].get('iid')) is int and matches[0]['iid'] > 0, 'ambiguous_merged_mr')
     mr, _ = getter(origin, prefix + '/merge_requests/' + str(matches[0]['iid']), token)
-    require(type(mr) is dict and mr.get('iid') == matches[0]['iid'] and mr.get('author', {}).get('id') == context['actorId'] and mr.get('source_project_id') == mr.get('target_project_id') == context['projectId'] and mr.get('state') == 'merged' and mr.get('merge_commit_sha') == mr.get('sha') == context['sourceSha'] and mr.get('target_branch') == 'master' and re.fullmatch(r'(?:sdd|agent)/[A-Za-z0-9._/-]+', mr.get('source_branch', '')), 'merged_mr_identity_mismatch')
+    require(type(mr) is dict and mr.get('iid') == matches[0]['iid'] and mr.get('author', {}).get('id') == context['actorId'] and mr.get('source_project_id') == mr.get('target_project_id') == context['projectId'] and mr.get('state') == 'merged' and mr.get('merge_commit_sha') == context['sourceSha'] and mr.get('target_branch') == 'master' and re.fullmatch(r'(?:sdd|agent)/[A-Za-z0-9._/-]+', mr.get('source_branch', '')), 'merged_mr_identity_mismatch')
     ticket = envelope_from_description(mr.get('description'), context)
-    expected = gate.GateContext(job=context['job'], build_id=context['buildId'], source_sha=context['sourceSha'], project_id=context['projectId'], destination_id=job['destinationId'], environment='test', key_id=routes['keyId'])
+    payload = ticket['payload']
+    proof_fields = {}
+    if type(payload.get('version')) is int and payload['version'] == 2:
+        require(mr.get('sha') == payload.get('sourceSha'), 'merged_mr_source_mismatch')
+        # Authenticated commit API supplies parents, NOT an exact Git tree object ID.
+        commit, _ = getter(origin, prefix + '/repository/commits/' + context['sourceSha'], token)
+        require(type(commit) is dict and commit.get('id') == context['sourceSha']
+                and type(commit.get('parent_ids')) is list and len(commit['parent_ids']) == 2
+                and all(type(parent) is str and SHA.fullmatch(parent) for parent in commit['parent_ids']), 'invalid_merge_commit')
+        proof_fields = dict(approved_source_sha=payload.get('sourceSha'), target_sha=payload.get('targetSha'),
+                            parents=tuple(commit['parent_ids']))
+    else:
+        require(mr.get('sha') == context['sourceSha'], 'merged_mr_identity_mismatch')
+    expected = gate.GateContext(job=context['job'], build_id=context['buildId'], source_sha=context['sourceSha'], project_id=context['projectId'], destination_id=job['destinationId'], environment='test', key_id=routes['keyId'], **proof_fields)
     key = gate._private_read(str(KEY), gate.MAX_KEY_BYTES)
-    checked = gate.validate(ticket, key, expected, now or datetime.now(timezone.utc))
+    checked = (gate.validate_preparation if proof_fields else gate.validate)(ticket, key, expected, now or datetime.now(timezone.utc))
+    if proof_fields:
+        context = dict(context, ticketVersion=2, approvedSourceSha=payload['sourceSha'], targetSha=payload['targetSha'],
+                       expectedTreeSha=payload['expectedTreeSha'], parents=list(expected.parents),
+                       validationProfile=payload['validationProfile'], proofPending=True)
     document = dict(version=1, context=dict(context, keyId=routes['keyId'], destinationId=job['destinationId'], mergeRequestIid=mr['iid']), ticket=ticket)
     basename = hashlib.sha256(gate.canonical([context['projectId'], context['job'], context['buildId'], context['sourceSha']])).hexdigest() + '.json'
     directory = gate._directory(gate._parts(str(PREPARED)), private=True)
@@ -228,8 +256,14 @@ def prepare(env, *, trusted_target=None, routes_file=ROUTES, getter=api_get, now
     return dict(context, contextPath=str(PREPARED / basename), keyId=routes['keyId'], destinationId=job['destinationId'], admissionDeadline=checked['admissionDeadline'])
 
 
-def admit_prepared(prepared, expected, *, now=None):
-    """Deploy-worker-only: consumes once immediately before the existing patch."""
+def admit_prepared(prepared, expected, *, commit_proof=None, now=None):
+    """Consume at write boundary; v2 commit_proof comes ONLY from trusted local Git/audit.
+
+    commit_proof={sha:M, parents:[T,S], treeSha:E,
+                  verification:{source:M, profile:'full-verify', passed:True}}.
+    Never copy it from model arguments, build parameters or an untrusted report.
+    V1 needs no new proof and retains its exact SHA contract.
+    """
     require(type(prepared) is dict and prepared.get('version') == 1 and prepared.get('mode') in ('manual', 'human', 'nightshift'), 'missing_prepared_identity')
     if prepared['mode'] in ('manual', 'human'):
         if prepared['mode'] == 'human':
@@ -247,9 +281,34 @@ def admit_prepared(prepared, expected, *, now=None):
     context = document.get('context', {})
     require(document.get('version') == 1 and context.get('mode') == 'nightshift' and all(context.get(key) == prepared.get(key) for key in ('actorId', 'projectId', 'projectPath', 'sourceSha', 'job', 'buildId', 'environment', 'gitlabOrigin', 'keyId', 'destinationId', 'target')), 'prepared_context_changed')
     require(target_identity(context.get('target')) == actual_target, 'prepared_target_changed')
+    ticket = document.get('ticket')
+    require(type(ticket) is dict and type(ticket.get('payload')) is dict, 'invalid_prepared_ticket')
+    payload = ticket['payload']
+    proof_fields = {}
+    if type(payload.get('version')) is int and payload['version'] == 2:
+        plan = {'ticketVersion': 2, 'approvedSourceSha': payload.get('sourceSha'), 'targetSha': payload.get('targetSha'),
+                'expectedTreeSha': payload.get('expectedTreeSha'), 'validationProfile': payload.get('validationProfile'),
+                'parents': [payload.get('targetSha'), payload.get('sourceSha')], 'proofPending': True}
+        require(all(context.get(field) == value and prepared.get(field) == value for field, value in plan.items()), 'prepared_merge_plan_changed')
+        require(type(commit_proof) is dict and set(commit_proof) == {'sha', 'parents', 'treeSha', 'verification'}, 'missing_commit_proof')
+        verification = commit_proof['verification']
+        require(type(verification) is dict and set(verification) == {'source', 'profile', 'passed'}, 'invalid_verification_proof')
+        require(type(commit_proof['parents']) is list and len(commit_proof['parents']) == 2
+                and type(commit_proof['sha']) is str and commit_proof['sha'] == expected['sourceSha'], 'local_commit_mismatch')
+        proof_fields = dict(approved_source_sha=context['approvedSourceSha'], target_sha=context['targetSha'],
+                            tree_sha=commit_proof['treeSha'], parents=tuple(commit_proof['parents']),
+                            verification_source_sha=verification['source'], verification_profile=verification['profile'],
+                            verification_passed=verification['passed'])
+    else:
+        require(context.get('ticketVersion', 1) == 1 and prepared.get('ticketVersion', 1) == 1, 'prepared_ticket_version_changed')
     key = gate._private_read(str(KEY), gate.MAX_KEY_BYTES)
-    gate_context = gate.GateContext(job=expected['job'], build_id=expected['buildId'], source_sha=expected['sourceSha'], project_id=expected['projectId'], destination_id=context['destinationId'], environment='test', key_id=context['keyId'])
-    result = gate.admit(document['ticket'], key, gate_context, str(STATE), clock=(lambda: now) if now else gate._utcnow)
+    gate_context = gate.GateContext(job=expected['job'], build_id=expected['buildId'], source_sha=expected['sourceSha'], project_id=expected['projectId'], destination_id=context['destinationId'], environment='test', key_id=context['keyId'], **proof_fields)
+    result = gate.admit(ticket, key, gate_context, str(STATE), clock=(lambda: now) if now else gate._utcnow)
+    if proof_fields:
+        # Built ONLY from authenticated plan + validated actual local proof after
+        # single-use admission. It is verification evidence, not deployment success.
+        result['mergeVerification'] = dict(version=2, sourceSha=result['approvedSourceSha'], deployedSha=result['sourceSha'],
+            targetSha=result['targetSha'], treeSha=result['treeSha'], parents=result['parents'], profile=result['validationProfile'], passed=True)
     return dict(result, gated=True)
 
 

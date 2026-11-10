@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
-import type { DispatchContext, ReleaseRepository, ReleaseRequest, ReleaseScope, ReleaseTransport, RemoteSnapshot } from './contracts.ts'
+import type { DispatchContext, MergePlan, ReleaseOperation, ReleaseRepository, ReleaseRequest, ReleaseScope, ReleaseTransport, RemoteSnapshot } from './contracts.ts'
+import type { DeploymentTicketEvidence } from './deployment-tickets.ts'
+import { createMergeObjects } from './merge-objects.ts'
 import { createGitPushTransport, isSha, readLocalCommitEvidence, readReleaseCredential, releaseOrigin, validSourceBranch, type GitPushOptions, type GitPushRequest, type ReleaseCredential } from './git-transport.ts'
 
 /** API references (read against GitLab REST v4; unsupported evidence fails closed):
@@ -23,7 +25,9 @@ export interface GitlabTransportOptions {
   deploymentTickets?: {
     metadata(context: DispatchContext): Promise<string>
     verify(context: DispatchContext, description: string): Promise<void>
+    evidence?(taskId: string, repository: string, sha: string): Promise<DeploymentTicketEvidence | undefined>
   }
+  mergeObjects?: ReturnType<typeof createMergeObjects>
 }
 type Json = Record<string, any>
 const id = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0
@@ -96,9 +100,21 @@ class GitlabClient {
   }
 }
 
+const MERGE_PREFIX = '<!-- superagent-merge-v2\n', BLOCK_END = '\n-->'
+function canonical(value: any): string { return Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value) }
+function mergeBlock(operationId: string, plan: MergePlan, expiresAt: string): string { return `${MERGE_PREFIX}${canonical({ operationId, plan, expiresAt })}${BLOCK_END}` }
+function reservedBlock(description: string, prefix: string): string | undefined {
+  const marker = prefix.trim(), positions = [...description.matchAll(new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))]
+  if (!positions.length) return undefined
+  if (positions.length !== 1) reject('Ambiguous reserved release metadata')
+  const start = positions[0]!.index!, end = description.indexOf(BLOCK_END, start)
+  if (end < 0 || !description.slice(start).startsWith(prefix)) reject('Malformed reserved release metadata')
+  return description.slice(start, end + BLOCK_END.length)
+}
 export function createGitlabTransport(options: GitlabTransportOptions): ReleaseTransport {
   const push = options.push ?? createGitPushTransport({ tempRoot: options.tempRoot, runGit: options.runGit })
-  async function inspect(repository: ReleaseRepository, scope: ReleaseScope, request: ReleaseRequest, credential: ReleaseCredential, signal: AbortSignal): Promise<RemoteSnapshot> {
+  const objects = options.mergeObjects ?? createMergeObjects({ tempRoot: options.tempRoot, runGit: options.runGit })
+  async function inspect(repository: ReleaseRepository, scope: ReleaseScope, request: ReleaseRequest, credential: ReleaseCredential, signal: AbortSignal, operation?: ReleaseOperation): Promise<RemoteSnapshot> {
     contextValid(repository, scope, request)
     const client = new GitlabClient(repository, credential, options, signal)
     const prefix = `/api/v4/projects/${repository.projectId}`
@@ -113,7 +129,7 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
     if (!raw || !(raw.value instanceof Uint8Array)) reject('Target CI evidence is missing')
     const attestation = repository.triggerPolicy
     const validAttestation = attestation.productionExcluded === true && Number.isFinite(Date.parse(attestation.reviewedAt)) && Date.parse(attestation.reviewedAt) <= Date.now() && Date.parse(attestation.expiresAt) > Date.now()
-    const snapshot: RemoteSnapshot = { identity: { id: user.id, username: user.username }, project: { id: project.id, path: project.path_with_namespace, defaultBranch: project.default_branch, pipelineRequired: project.only_allow_merge_if_pipeline_succeeds === true, fastForwardOnly: project.merge_method === 'ff' && project.squash_option !== 'always' }, ...(source ? { sourceSha: source.commit.id } : {}), targetSha: target.commit.id, targetCiSha256: sha256(raw.value), productionExcluded: validAttestation, triggerPolicyFingerprint: attestation.fingerprint }
+    const snapshot: RemoteSnapshot = { identity: { id: user.id, username: user.username }, project: { id: project.id, path: project.path_with_namespace, defaultBranch: project.default_branch, pipelineRequired: project.only_allow_merge_if_pipeline_succeeds === true, fastForwardOnly: project.merge_method === 'ff' && project.squash_option !== 'always', ...(['ff', 'merge', 'rebase_merge'].includes(project.merge_method) && project.squash_option !== 'always' ? { mergeMethod: project.merge_method as 'ff' | 'merge' | 'rebase_merge' } : {}) }, ...(source ? { sourceSha: source.commit.id } : {}), targetSha: target.commit.id, targetCiSha256: sha256(raw.value), productionExcluded: validAttestation, triggerPolicyFingerprint: attestation.fingerprint }
     if (source && source.commit.id === request.sha) {
       const candidateCi = await client.request(`${prefix}/repository/files/${encodeURIComponent('.gitlab-ci.yml')}/raw?ref=${request.sha}`)
       if (!candidateCi || !(candidateCi.value instanceof Uint8Array) || sha256(candidateCi.value) !== repository.ciSha256) reject('Remote candidate CI differs from reviewed policy')
@@ -138,7 +154,31 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
         for (const note of discussion.notes) { if (note.resolvable === true && note.resolved !== true) unresolved++ }
       }
       snapshot.mergeRequest = { iid: item.iid, sourceProjectId: mr.source_project_id, targetProjectId: mr.target_project_id, sourceBranch: mr.source_branch, targetBranch: mr.target_branch, sha: mr.sha, state: mr.state, authorId: mr.author.id, draft: typeof mr.draft === 'boolean' ? mr.draft : mr.work_in_progress !== false, conflicts: mr.has_conflicts !== false, mergeable: (mr.detailed_merge_status === 'mergeable' || (!mr.detailed_merge_status && mr.merge_status === 'can_be_merged')) && mr.squash !== true && mr.squash_on_merge !== true && mr.merge_when_pipeline_succeeds !== true, approved, unresolvedDiscussions: unresolved, marker }
-      if (mr.state === 'merged') {
+      if (repository.mergeMode === 'merge-commit') {
+        const block = reservedBlock(mr.description, MERGE_PREFIX)
+        if (block) {
+          const parsed = JSON.parse(block.slice(MERGE_PREFIX.length, -BLOCK_END.length)) as { operationId: string; plan: MergePlan; expiresAt: string }
+          const expectedId = operation?.action === 'prepare_merge' ? operation.id : operation?.preparationId
+          if (operation?.mergePlan && expectedId) {
+            if (block !== mergeBlock(expectedId, operation.mergePlan, parsed.expiresAt) || !Number.isFinite(Date.parse(parsed.expiresAt))) reject('Prepared merge metadata changed')
+            let tickets = ''
+            if (repository.mergeTriggersDeploy) {
+              const evidence = await options.deploymentTickets?.evidence?.(request.taskId, repository.alias, request.sha)
+              tickets = reservedBlock(mr.description, '<!-- superagent-deploy-v1\n') ?? ''
+              if (!evidence || evidence.operationId !== expectedId || !tickets || tickets !== evidence.metadata || canonical(evidence.mergePlan) !== canonical(operation.mergePlan) || evidence.deadline !== parsed.expiresAt) reject('Signed merge preparation is absent or different from the immutable private record')
+            }
+            snapshot.preparation = { plan: structuredClone(operation.mergePlan), operationId: expectedId, metadataDigest: sha256(Buffer.from(block + tickets)), expiresAt: parsed.expiresAt, verified: true }
+          }
+        }
+      }
+      if (mr.state === 'merged' && repository.mergeMode === 'merge-commit') {
+        const plan = operation?.mergePlan, prepared = snapshot.preparation
+        if (!plan || !prepared?.verified || !isSha(mr.merge_commit_sha) || mr.merge_commit_sha === request.sha || snapshot.targetSha !== mr.merge_commit_sha || snapshot.project.mergeMethod !== 'merge') reject('Ordinary merge result lacks its exact prepared plan')
+        const commit = await client.json(`${prefix}/repository/commits/${mr.merge_commit_sha}`)
+        const actual = await objects.readCommit(repository, mr.merge_commit_sha, credential, signal)
+        if (commit?.id !== mr.merge_commit_sha || JSON.stringify(commit.parent_ids) !== JSON.stringify([plan.targetSha, request.sha]) || JSON.stringify(actual.parents) !== JSON.stringify(commit.parent_ids) || actual.treeSha !== plan.expectedTreeSha) reject('Actual merge parents or tree differ from the prepared source/target; deployment remains blocked')
+        snapshot.mergeRequest.mergeCommitSha = mr.merge_commit_sha; snapshot.mergeRequest.mergeTreeSha = actual.treeSha; snapshot.mergeRequest.mergeParents = actual.parents; snapshot.mergeRequest.mergeCommitVerified = true
+      } else if (mr.state === 'merged') {
         if (!isSha(mr.merge_commit_sha) || mr.merge_commit_sha !== request.sha || snapshot.targetSha !== request.sha || snapshot.project.fastForwardOnly !== true) reject('Merged result is not the exact admitted fast-forward SHA')
         const commit = await client.json(`${prefix}/repository/commits/${request.sha}`)
         if (commit?.id !== request.sha || !Array.isArray(commit.parent_ids) || !commit.parent_ids.every(isSha)) reject('Merged commit evidence unavailable')
@@ -169,22 +209,26 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
     if (typeof context.assertAuthorized !== 'function') reject('Live host authorization callback is required')
     context.assertAuthorized()
     if (!Number.isFinite(Date.parse(context.deadline)) || Date.now() >= Date.parse(context.deadline) || Date.now() >= Date.parse(context.grant.expiresAt)) reject('Release dispatch deadline expired')
-    if (!context.scope.actions.includes(context.request.action) || context.grant.taskId !== context.request.taskId || context.candidate.taskId !== context.request.taskId || context.candidate.repository !== context.request.repository || context.candidate.sourceBranch !== context.scope.sourceBranch || context.candidate.baseSha !== context.scope.baseSha || context.candidate.sha !== context.request.sha || !context.candidate.validated || !context.candidate.clean || !context.candidate.commitReceiptId || !context.candidate.validationReceiptIds.length || context.candidate.changedProtectedPaths.length || context.candidate.ciSha256 !== context.repository.ciSha256) reject('Candidate or release capability is not admitted')
-    if (context.request.action === 'merge' && context.repository.mergeTriggersDeploy && (!context.scope.actions.includes('deploy') || !context.scope.environment)) reject('Merge-triggered deployment requires a paired environment deploy grant')
+    if (!context.scope.actions.includes(context.request.action === 'prepare_merge' ? 'merge' : context.request.action) || context.grant.taskId !== context.request.taskId || context.candidate.taskId !== context.request.taskId || context.candidate.repository !== context.request.repository || context.candidate.sourceBranch !== context.scope.sourceBranch || context.candidate.baseSha !== context.scope.baseSha || context.candidate.sha !== context.request.sha || !context.candidate.validated || !context.candidate.clean || !context.candidate.commitReceiptId || !context.candidate.validationReceiptIds.length || context.candidate.changedProtectedPaths.length || context.candidate.ciSha256 !== context.repository.ciSha256) reject('Candidate or release capability is not admitted')
+    if (['merge', 'prepare_merge'].includes(context.request.action) && context.repository.mergeTriggersDeploy && (!context.scope.actions.includes('deploy') || !context.scope.environment)) reject('Merge-triggered deployment requires a paired environment deploy grant')
   }
   return {
     async observe(context, signal) {
       contextValid(context.repository, context.scope, context.request)
       const credential = await readReleaseCredential(context.repository)
-      return inspect(context.repository, context.scope, context.request, credential, signal)
+      return inspect(context.repository, context.scope, context.request, credential, signal, context.operation)
+    },
+    async planMerge(context, signal) {
+      const credential = await readReleaseCredential(context.repository)
+      return objects.plan(context.repository, context.scope, context.request, context.candidate, context.snapshot, credential, signal)
     },
     async dispatch(context, signal) {
       liveBoundary(context, signal)
       if (context.request.action === 'deploy') reject('Jenkins deployment requires its separate verified transport; GitLab adapter cannot deploy')
       const credential = await readReleaseCredential(context.repository)
       const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, Math.min(Date.parse(context.deadline), Date.parse(context.grant.expiresAt)) - Date.now()))])
-      const fresh = await inspect(context.repository, context.scope, context.request, credential, boundedSignal)
-      if (!fresh.productionExcluded || fresh.targetCiSha256 !== context.repository.ciSha256 || fresh.triggerPolicyFingerprint !== context.snapshot.triggerPolicyFingerprint || fresh.targetSha !== context.snapshot.targetSha) reject('Release policy, reviewed CI or target changed before dispatch')
+      const fresh = await inspect(context.repository, context.scope, context.request, credential, boundedSignal, context.operation)
+      if (!fresh.productionExcluded || fresh.targetCiSha256 !== context.repository.ciSha256 || fresh.triggerPolicyFingerprint !== context.snapshot.triggerPolicyFingerprint || (['merge', 'prepare_merge'].includes(context.request.action) && fresh.targetSha !== context.snapshot.targetSha)) reject('Release policy, reviewed CI or target changed before dispatch')
       const { repository, scope, request } = context
       const client = new GitlabClient(repository, credential, options, boundedSignal)
       const prefix = `/api/v4/projects/${repository.projectId}`
@@ -196,8 +240,8 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
       if (fresh.sourceSha !== request.sha) reject('Exact candidate must already be pushed')
       if (request.action === 'create_mr') {
         if (fresh.mergeRequest) return { remoteIds: [`mr:${repository.projectId}:${fresh.mergeRequest.iid}`], detail: 'Exact marked merge request already exists; no duplicate sent' }
-        if (!request.title?.trim() || request.title.length > 250 || (request.description?.length ?? 0) > 8000 || /nightshift:|superagent-deploy-v1/.test(request.description ?? '')) reject('Invalid bounded merge request title/description')
-        const needsTickets = repository.mergeTriggersDeploy && scope.actions.includes('merge')
+        if (!request.title?.trim() || request.title.length > 250 || (request.description?.length ?? 0) > 8000 || /nightshift:|superagent-deploy-v1|superagent-merge-v2/.test(request.description ?? '')) reject('Invalid bounded merge request title/description')
+        const needsTickets = repository.mergeMode !== 'merge-commit' && repository.mergeTriggersDeploy && scope.actions.includes('merge')
         const metadata = needsTickets ? await options.deploymentTickets?.metadata(context) : ''
         if (needsTickets && (!metadata || metadata.length > 60000)) reject('Signed deployment metadata is required for merge-triggered deployment')
         liveBoundary(context, boundedSignal)
@@ -207,19 +251,40 @@ export function createGitlabTransport(options: GitlabTransportOptions): ReleaseT
         return { remoteIds: [`mr:${repository.projectId}:${body.iid}`], detail: 'One merge request creation accepted; exact marked readback required' }
       }
       const mr = fresh.mergeRequest; const pipeline = fresh.pipeline
-      if (fresh.project.fastForwardOnly !== true || !fresh.project.pipelineRequired || fresh.targetSha !== scope.baseSha || !mr || mr.state !== 'opened' || mr.draft || mr.conflicts || !mr.mergeable || !mr.approved || mr.unresolvedDiscussions !== 0 || !pipeline || pipeline.sha !== request.sha || pipeline.status !== 'success' || !repository.requiredJobs.length || repository.requiredJobs.some(name => pipeline.jobs.filter(job => job.name === name && job.status === 'success' && !job.allowFailure).length !== 1)) reject('Fast-forward merge gates, exact pipeline jobs or approvals are not satisfied')
-      // REST sha is source CAS only; FF-only server policy supplies the target race gate.
+      const ordinary = repository.mergeMode === 'merge-commit', plan = context.operation.mergePlan
+      const mergePolicyValid = ordinary ? fresh.project.mergeMethod === 'merge' && !!plan && plan.sourceSha === request.sha && plan.targetSha === fresh.targetSha && plan.ciSha256 === repository.ciSha256 && plan.validationProfile === 'full-verify' : fresh.project.fastForwardOnly === true && fresh.targetSha === scope.baseSha
+      if (!mergePolicyValid || !fresh.project.pipelineRequired || !mr || mr.state !== 'opened' || mr.draft || mr.conflicts || !mr.mergeable || !mr.approved || mr.unresolvedDiscussions !== 0 || !pipeline || pipeline.sha !== request.sha || pipeline.status !== 'success' || !repository.requiredJobs.length || repository.requiredJobs.some(name => pipeline.jobs.filter(job => job.name === name && job.status === 'success' && !job.allowFailure).length !== 1)) reject('Fast-forward merge gates, exact pipeline jobs or approvals are not satisfied')
+      if (request.action === 'prepare_merge') {
+        if (!ordinary || !plan) reject('Preparation requires an ordinary merge plan')
+        const head = await client.json(`${prefix}/merge_requests/${mr.iid}`)
+        if (head?.sha !== request.sha || head.state !== 'opened' || !text(head.description) || Buffer.byteLength(head.description) > 16000 || reservedBlock(head.description, MERGE_PREFIX) || reservedBlock(head.description, '<!-- superagent-deploy-v1\n')) reject('Preparation metadata already exists or MR changed; never replace it automatically')
+        const metadata = repository.mergeTriggersDeploy ? await options.deploymentTickets?.metadata(context) : ''
+        if (repository.mergeTriggersDeploy && !metadata) reject('Missing signed ordinary-merge deployment ticket')
+        const ticketEvidence = repository.mergeTriggersDeploy ? await options.deploymentTickets?.evidence?.(request.taskId, repository.alias, request.sha) : undefined
+        if (repository.mergeTriggersDeploy && (!ticketEvidence?.metadata || ticketEvidence.metadata !== metadata || ticketEvidence.operationId !== context.operation.id)) reject('Created signed metadata lacks exact private evidence')
+        const preparedBlock = mergeBlock(context.operation.id, plan, ticketEvidence?.deadline ?? context.deadline)
+        const finalTarget = await client.json(`${prefix}/repository/branches/${encodeURIComponent(scope.targetBranch)}`)
+        if (finalTarget?.commit?.id !== plan.targetSha) reject('Target changed before preparation write; no automatic refresh')
+        liveBoundary(context, boundedSignal)
+        await client.request(`${prefix}/merge_requests/${mr.iid}`, 'PUT', { description: `${head.description}\n\n${preparedBlock}${metadata ? `\n\n${metadata}` : ''}` })
+        return { remoteIds: [`mr:${repository.projectId}:${mr.iid}`], detail: 'One immutable merge preparation metadata update accepted; exact readback required' }
+      }
+      if (request.action !== 'merge') reject('Unsupported release mutation')
+      if (ordinary && (!fresh.preparation?.verified || fresh.preparation.operationId !== context.operation.preparationId || canonical(fresh.preparation.plan) !== canonical(plan))) reject('Exact prepared merge metadata required')
+      // REST sha is source CAS only. Ordinary target races are denied at the actual deployment gate by [T,S]/tree proof.
       const finalProject = await client.json(prefix)
       const target = await client.json(`${prefix}/repository/branches/${encodeURIComponent(scope.targetBranch)}`)
       const head = await client.json(`${prefix}/merge_requests/${mr.iid}`)
-      if (finalProject?.merge_method !== 'ff' || finalProject.only_allow_merge_if_pipeline_succeeds !== true || finalProject.squash_option === 'always' || target?.commit?.id !== scope.baseSha || head?.sha !== request.sha || head.state !== 'opened' || head.squash === true || head.squash_on_merge === true) reject('Source, target or merge policy drifted at final merge read')
+      if (finalProject?.merge_method !== (ordinary ? 'merge' : 'ff') || finalProject.only_allow_merge_if_pipeline_succeeds !== true || finalProject.squash_option === 'always' || target?.commit?.id !== (ordinary ? plan!.targetSha : scope.baseSha) || head?.sha !== request.sha || head.state !== 'opened' || head.squash === true || head.squash_on_merge === true) reject('Source, target or merge policy drifted at final merge read')
+      if (ordinary && (!text(head.description) || reservedBlock(head.description, MERGE_PREFIX) !== mergeBlock(context.operation.preparationId!, plan!, fresh.preparation!.expiresAt))) reject('Prepared metadata changed at final merge read')
       if (repository.mergeTriggersDeploy) {
         if (!options.deploymentTickets || typeof head.description !== 'string') reject('Signed deployment ticket verification unavailable')
         await options.deploymentTickets.verify(context, head.description)
       }
+      if (ordinary && (Date.parse(fresh.preparation!.expiresAt) <= Date.now() || Date.parse(fresh.preparation!.expiresAt) > Date.parse(context.deadline))) reject('Prepared merge window expired or exceeds the live deadline')
       liveBoundary(context, boundedSignal)
       await client.request(`${prefix}/merge_requests/${mr.iid}/merge`, 'PUT', { sha: request.sha, squash: false, should_remove_source_branch: false, merge_when_pipeline_succeeds: false })
-      return { remoteIds: [`mr:${repository.projectId}:${mr.iid}`, `sha:${request.sha}`], detail: 'One immediate FF-only merge request accepted; exact merged-SHA readback required' }
+      return { remoteIds: [`mr:${repository.projectId}:${mr.iid}`, `sha:${request.sha}`], detail: ordinary ? 'One ordinary merge request accepted; actual merged parents/tree and full-test deployment readback required' : 'One immediate FF-only merge request accepted; exact merged-SHA readback required' }
     },
   }
 }

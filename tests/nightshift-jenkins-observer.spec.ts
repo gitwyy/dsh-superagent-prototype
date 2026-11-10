@@ -4,7 +4,7 @@ import { chmodSync, linkSync, mkdtempSync, realpathSync, rmSync, symlinkSync, wr
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { overlayJenkinsObservation, type JenkinsDeploymentAttestation, type JenkinsObservationContext, type JenkinsObserverOptions } from '../src/nightshift/release/jenkins-observer.ts'
-import { releaseMarker, type RemoteSnapshot } from '../src/nightshift/release/contracts.ts'
+import { releaseMarker, type MergePlan, type RemoteSnapshot } from '../src/nightshift/release/contracts.ts'
 
 const SHA = 'a'.repeat(40), OTHER = 'b'.repeat(40), CONFIG = 'c'.repeat(64), ARTIFACT = 'd'.repeat(64), WEB = 'e'.repeat(64)
 const ORIGIN = 'http://127.0.0.1:18765', JOB = 'test/backend', NUMBER = 57, QUEUE = 101
@@ -229,6 +229,138 @@ describe('exact build selection and remote activity', () => {
     h.build.actions = [{ lastBuiltRevision: { SHA1: SHA } }]
     h.queue.items = [{ id: QUEUE + 1, task: { fullName: JOB }, actions: [{ parameters: [{ name: 'source40', value: SHA }] }] }]
     expect((await h.observe()).deployment!.state).toBe('unknown')
+  })
+})
+
+describe('ordinary merge actual-M full verification', () => {
+  const MERGED = 'f'.repeat(40), TREE = '1'.repeat(40)
+  function ordinary(kind: 'java' | 'web' = 'java') {
+    const h = fixture(kind), plan: MergePlan = { version: 2, sourceSha: SHA, targetSha: OTHER, expectedTreeSha: TREE, ciSha256: CONFIG, validationProfile: 'full-verify' }
+    h.context.repository.mergeMode = 'merge-commit'; h.attestation.mergePlan = plan
+    h.attestation.notBefore = future(-2000); h.build.timestamp = Date.now() - 1000
+    h.snapshot.targetSha = MERGED; h.snapshot.project.fastForwardOnly = false; h.snapshot.project.mergeMethod = 'merge'
+    Object.assign(h.snapshot.mergeRequest!, { mergeCommitSha: MERGED, mergeTreeSha: TREE, mergeParents: [OTHER, SHA] })
+    h.build.actions = [{ lastBuiltRevision: { SHA1: MERGED } }, { parameters: [{ name: 'branch', value: MERGED }] }]
+    h.release.source = h.attempt.source = MERGED
+    if (kind === 'web') {
+      h.attempt.release.source = h.attempt.audit.source = h.attempt.image_inputs.source = MERGED
+      h.attempt.profile = h.attempt.audit.profile = 'full-verify'; h.attempt.audit.tests_executed = true
+    }
+    const verification: Json = { version: 2, sourceSha: SHA, deployedSha: MERGED, targetSha: OTHER, treeSha: TREE, parents: [OTHER, SHA], profile: 'full-verify', passed: true }
+    const audit: Json = { tests: 10, skipped: 2, failures: 0, errors: 0, core_executed: 8, reason: null }
+    h.responses.set(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/nightshift-merge-verification.json`, verification)
+    h.responses.set(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/test-audit.json`, audit)
+    return { ...h, plan, verification, audit }
+  }
+
+  it.each(['java', 'web'] as const)('reports %s deployment M, approved S, pinned tree E and full-verification only after actual-M audit', async kind => {
+    const h = ordinary(kind), result = await h.observe()
+    expect(result.deployment).toMatchObject({ state: 'succeeded', sourceSha: MERGED, approvedSourceSha: SHA, mergePlan: h.plan,
+      fullVerification: { sha: MERGED, treeSha: TREE, profile: 'full-verify', passed: true }, builds: [{ sha: MERGED, state: 'succeeded' }] })
+  })
+
+  it.each(['unverified', 'parents-order', 'tree', 'source', 'target', 'missing-plan', 'ci', 'profile', 'extra-plan', 'missing-bound'] as const)('refuses %s merge object or private plan before Jenkins reads', async invalid => {
+    const h = ordinary()
+    if (invalid === 'unverified') h.snapshot.mergeRequest!.mergeCommitVerified = false
+    if (invalid === 'parents-order') h.snapshot.mergeRequest!.mergeParents = [SHA, OTHER]
+    if (invalid === 'tree') h.snapshot.mergeRequest!.mergeTreeSha = OTHER
+    if (invalid === 'source') h.plan.sourceSha = OTHER
+    if (invalid === 'target') h.snapshot.targetSha = SHA
+    if (invalid === 'missing-plan') delete h.attestation.mergePlan
+    if (invalid === 'ci') h.plan.ciSha256 = WEB
+    if (invalid === 'profile') Object.assign(h.plan, { validationProfile: 'package-only' })
+    if (invalid === 'extra-plan') Object.assign(h.plan, { generation: 2 })
+    if (invalid === 'missing-bound') delete h.attestation.notBefore
+    expect((await h.observe()).deployment!.state).toBe('unknown'); expect(h.fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each(['missing', 'extra', 'source', 'deployed', 'parents', 'tree', 'profile', 'passed'] as const)('denies %s trusted merge-verification artifact instead of relying on Jenkins SUCCESS', async invalid => {
+    const h = ordinary()
+    if (invalid === 'missing') h.responses.delete(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/nightshift-merge-verification.json`)
+    if (invalid === 'extra') h.verification.tests = 10
+    if (invalid === 'source') h.verification.sourceSha = MERGED
+    if (invalid === 'deployed') h.verification.deployedSha = SHA
+    if (invalid === 'parents') h.verification.parents.reverse()
+    if (invalid === 'tree') h.verification.treeSha = OTHER
+    if (invalid === 'profile') h.verification.profile = 'package-only'
+    if (invalid === 'passed') h.verification.passed = false
+    const result = await h.observe()
+    expect(result.deployment).toMatchObject({ state: 'unknown', sourceSha: MERGED, approvedSourceSha: SHA, healthy: false })
+    expect(result.deployment).not.toHaveProperty('fullVerification')
+  })
+
+  it.each(['missing', 'extra', 'no-tests', 'all-skipped', 'failures', 'errors', 'core', 'impossible-core', 'reason'] as const)('denies Java %s full test audit', async invalid => {
+    const h = ordinary()
+    if (invalid === 'missing') h.responses.delete(`${jobPath(JOB)}/${NUMBER}/artifact/jenkins-evidence/test-audit.json`)
+    if (invalid === 'extra') h.audit.profile = 'full-verify'
+    if (invalid === 'no-tests') h.audit.tests = 0
+    if (invalid === 'all-skipped') h.audit.skipped = 10
+    if (invalid === 'failures') h.audit.failures = 1
+    if (invalid === 'errors') h.audit.errors = 1
+    if (invalid === 'core') h.audit.core_executed = 0
+    if (invalid === 'impossible-core') h.audit.core_executed = 9
+    if (invalid === 'reason') h.audit.reason = 'No core tests executed'
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+  })
+
+  it.each(['build-only', 'no-tests', 'wrong-config', 'audit-source'] as const)('denies frontend %s audit despite a valid merge artifact', async invalid => {
+    const h = ordinary('web')
+    if (invalid === 'build-only') { h.attempt.profile = h.attempt.audit.profile = 'build-only'; h.attempt.audit.tests_executed = false }
+    if (invalid === 'no-tests') h.attempt.audit.tests_executed = false
+    if (invalid === 'wrong-config') { Object.assign(h.attestation.targets[JOB]!, { buildConfigSha256: WEB }) }
+    if (invalid === 'audit-source') h.attempt.audit.source = SHA
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+  })
+
+  it('uses approved S only for premerge absence and blocks target drift or known source builds', async () => {
+    const h = ordinary(); h.snapshot.mergeRequest!.state = 'opened'; h.snapshot.targetSha = OTHER; h.list.builds = []
+    expect((await h.observe()).deployment).toMatchObject({ state: 'absent', sourceSha: SHA, approvedSourceSha: SHA, mergePlan: h.plan })
+    h.snapshot.targetSha = MERGED
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+    h.snapshot.targetSha = OTHER; h.build.actions = [{ lastBuiltRevision: { SHA1: SHA } }]; h.list.builds = [h.build]
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+  })
+
+  it('selects M rather than S and keeps actual-M duplicates/history uncertainty conservative', async () => {
+    const h = ordinary()
+    h.list.builds.push({ ...h.build, number: 58, queueId: 102, actions: [{ lastBuiltRevision: { SHA1: SHA } }] })
+    expect((await h.observe()).deployment!.state).toBe('succeeded')
+    h.list.builds[1].actions = [{ lastBuiltRevision: { SHA1: MERGED } }]
+    expect((await h.observe()).deployment!.state).toBe('unknown')
+  })
+
+  it('tracks actual-M queue identity and never substitutes a source-S build', async () => {
+    const h = ordinary(); h.list.builds = []
+    h.queue.items = [{ id: QUEUE, task: { fullName: JOB }, actions: [{ parameters: [{ name: 'source40', value: MERGED }] }] }]
+    expect((await h.observe()).deployment).toMatchObject({ state: 'queued', sourceSha: MERGED, builds: [{ sha: MERGED }] })
+    h.queue.items = []; h.build.actions = [{ lastBuiltRevision: { SHA1: SHA } }]; h.list.builds = [h.build]
+    expect((await h.observe()).deployment).toMatchObject({ state: 'unknown', sourceSha: MERGED, ids: [], awaitingWebhook: true })
+  })
+
+  it('requires every sibling full audit and emits one aggregate only after all verify', async () => {
+    const h = ordinary(), sibling = 'test/worker', number = 58
+    h.route.jobs.push(sibling); (h.route.expectedConfigSha256 as Record<string, string>)[sibling] = CONFIG
+    h.attestation.configSha256[sibling] = CONFIG; h.attestation.targets[sibling] = structuredClone(h.attestation.targets[JOB]!)
+    const build = { ...h.build, number, queueId: 102 }
+    h.responses.set(`${jobPath(sibling)}/api/json`, { builds: [build] })
+    h.responses.set(`${jobPath(sibling)}/${number}/api/json`, build)
+    h.responses.set(`${jobPath(sibling)}/${number}/artifact/jenkins-evidence/release.json`, { ...h.release, jenkins_job: sibling, jenkins_build: String(number) })
+    h.responses.set(`${jobPath(sibling)}/${number}/artifact/jenkins-evidence/attempt.json`, { ...h.attempt, jenkins_job: sibling, jenkins_build: String(number) })
+    h.responses.set(`${jobPath(sibling)}/${number}/artifact/jenkins-evidence/nightshift-merge-verification.json`, h.verification)
+    expect((await h.observe()).deployment).not.toHaveProperty('fullVerification')
+    h.responses.set(`${jobPath(sibling)}/${number}/artifact/jenkins-evidence/test-audit.json`, h.audit)
+    expect((await h.observe()).deployment).toMatchObject({ state: 'succeeded', builds: [{ sha: MERGED }, { sha: MERGED }],
+      fullVerification: { sha: MERGED, treeSha: TREE, profile: 'full-verify', passed: true } })
+  })
+
+  it('does not emit aggregate fullVerification until every sibling job has full exact-M evidence', async () => {
+    const h = ordinary(), sibling = 'test/worker'
+    h.route.jobs.push(sibling); (h.route.expectedConfigSha256 as Record<string, string>)[sibling] = CONFIG
+    h.attestation.configSha256[sibling] = CONFIG; h.attestation.targets[sibling] = structuredClone(h.attestation.targets[JOB]!)
+    h.responses.set(`${jobPath(sibling)}/api/json`, { builds: [] })
+    const result = await h.observe()
+    expect(result.deployment).toMatchObject({ state: 'unknown', sourceSha: MERGED, awaitingWebhook: true })
+    expect(result.deployment).not.toHaveProperty('fullVerification')
   })
 })
 

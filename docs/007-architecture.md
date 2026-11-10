@@ -296,6 +296,7 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `src/nightshift/release/coordinator.ts` | Durable release admission, live revocation, exact-SHA gates and read-only reconciliation |
 | `src/nightshift/release/journal.ts` | Persistent single-owner intent journal and restart ambiguity handling |
 | `src/nightshift/release/gitlab.ts` | Typed fixed-origin GitLab identity, MR/CI/merge observation and guarded dispatch |
+| `src/nightshift/release/merge-objects.ts` | Isolated authenticated Git object inspection, divergent merge-tree planning and actual remote merge parent/tree evidence |
 | `src/nightshift/release/git-transport.ts` | Isolated Git object export and exact-SHA nonforce push with private credentials |
 | `src/nightshift/release/action-bridge.ts` | Run-scoped private Unix socket for host validation/commit and release capabilities |
 | `src/nightshift/release/receipts.ts` | Durable host commit receipts and exact task-owned commit-chain candidate evidence |
@@ -437,6 +438,8 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/nightshift-deployment-tickets.spec.ts` | Immutable signed MR metadata and Python gate interoperability |
 | `tests/nightshift-composite-transport.spec.ts` | Cross-adapter ticket/attestation binding, expiry and last-boundary revocation |
 | `tests/nightshift-source-actor.spec.ts` | Trusted webhook actor provenance and preserved manual source selection |
+| `tests/nightshift-merge-objects.spec.ts` | Divergent target/source merge planning without checkout mutation; exact authenticated remote merge objects |
+| `tests/nightshift-publisher-merge.spec.ts` | Bot-only full verification, actual merge proof and versioned publisher asset integration |
 | `tests/nightshift-source-check.spec.ts` | Fixed non-executing local source gate, exact changed/staged files, and explicit no-tests/no-compile evidence |
 | `tests/nightshift-release-flow.spec.ts` | Real host receipt/coordinator/transport/ticket/observer composition with fake remote writes and signed gate evidence |
 | `tests/nightshift-release.spec.ts` | Durable remote intent, exact grants/identity/CI and automatic-deploy reconciliation |

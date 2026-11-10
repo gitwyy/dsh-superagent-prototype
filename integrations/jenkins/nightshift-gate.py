@@ -11,8 +11,16 @@ Host integration contract (this module neither configures nor contacts Jenkins):
     Sign canonical(payload): UTF-8 JSON, sorted keys, separators=(',', ':'),
     ensure_ascii=True, no floats. All string fields are bounded ASCII. Timestamps
     are explicit RFC3339 offsets (or Z). HMAC has no prefix for publisher interop.
-    Required payload fields are PAYLOAD_FIELDS below; optional signed buildId
-    restricts a known build. Otherwise the FIRST invocation binds job+build ID.
+    Required v1 payload fields are PAYLOAD_FIELDS below. V2 adds exactly targetSha,
+    expectedTreeSha, validationProfile='full-verify'; signed sourceSha is approved
+    candidate S, while GateContext.source_sha is actual deployed merge M. Ordered
+    commit parents must be [target T, candidate S], tree must equal signed E, and
+    trusted full verification must pass on M. No source/merge SHA equality guess.
+    validate_preparation only checks signature/window/route/parents and returns
+    proofPending=true, NOT valid/allowed; no API tree or successful tests invented.
+    Full validate/admit require trusted local object + verification evidence.
+    CLI has no caller-controlled proof flags; v2 CLI calls lacking proof deny.
+    Optional signed buildId restricts a known build. Otherwise the FIRST invocation binds job+build ID.
     jobs MUST contain one exact Jenkins full job name. Issue one ticket per job,
     immutable source SHA and operation; nonce must have at least 128 random bits.
   * The raw binary HMAC key (32..4096 bytes) is read only from --key-file, never
@@ -82,6 +90,7 @@ PAYLOAD_FIELDS = frozenset({
     "environment", "jobs", "destinationId", "issuedAt", "notBefore", "expiresAt",
     "freezeWindows", "keyId", "nonce",
 })
+V2_PAYLOAD_FIELDS = PAYLOAD_FIELDS | {"targetSha", "expectedTreeSha", "validationProfile"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z", re.ASCII)
 _NONCE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z", re.ASCII)
@@ -102,6 +111,14 @@ class GateContext:
     destination_id: str
     environment: str
     key_id: str
+    # Optional only for v1 compatibility; v2 requires every field at admission.
+    approved_source_sha: str | None = None
+    target_sha: str | None = None
+    tree_sha: str | None = None
+    parents: tuple[str, ...] | None = None
+    verification_source_sha: str | None = None
+    verification_profile: str | None = None
+    verification_passed: bool | None = None
 
 
 def canonical(value: Any) -> bytes:
@@ -171,7 +188,24 @@ def _window(value: Any) -> tuple[datetime, datetime]:
 
 def validate(ticket: dict[str, Any], key: bytes, context: GateContext,
              now: datetime) -> dict[str, Any]:
-    """Validate a signed ticket without consuming it. Result is NOT admission."""
+    """Fully validate ticket AND trusted local proof, without consuming intent."""
+    return _validate(ticket, key, context, now, preparation=False)
+
+
+def validate_preparation(ticket: dict[str, Any], key: bytes, context: GateContext,
+                         now: datetime) -> dict[str, Any]:
+    """Check controller signature/time/parents only; never a successful proof/admission."""
+    result = _validate(ticket, key, context, now, preparation=True)
+    result.pop("valid", None)
+    return dict(result, prepared=True, proofPending=ticket["payload"]["version"] == 2)
+
+
+def _object_sha(value: Any) -> bool:
+    return _text(value, _SHA) and value != "0" * len(value)
+
+
+def _validate(ticket: dict[str, Any], key: bytes, context: GateContext,
+              now: datetime, *, preparation: bool) -> dict[str, Any]:
     if type(key) is not bytes or not 32 <= len(key) <= MAX_KEY_BYTES:
         raise GateDenied("invalid_key")
     if type(context) is not GateContext:
@@ -184,15 +218,21 @@ def validate(ticket: dict[str, Any], key: bytes, context: GateContext,
     if type(ticket) is not dict or set(ticket) != {"payload", "signature"}:
         raise GateDenied("malformed_ticket")
     payload, signature = ticket["payload"], ticket["signature"]
-    if type(payload) is not dict or not (PAYLOAD_FIELDS <= set(payload)
-            and set(payload) <= PAYLOAD_FIELDS | {"buildId"}):
+    if type(payload) is not dict or type(payload.get("version")) is not int or payload["version"] not in (1, 2):
         raise GateDenied("malformed_ticket")
-    if (type(payload["version"]) is not int or payload["version"] != 1
-            or not _project(payload["projectId"])
+    version = payload["version"]
+    fields = PAYLOAD_FIELDS if version == 1 else V2_PAYLOAD_FIELDS
+    if not (fields <= set(payload) and set(payload) <= fields | {"buildId"}):
+        raise GateDenied("malformed_ticket")
+    if (not _project(payload["projectId"])
             or not _text(payload["sourceSha"], _SHA)
             or payload["environment"] not in ("test", "preprod")
             or not _text(payload["nonce"], _NONCE)):
         raise GateDenied("malformed_ticket")
+    if version == 2 and (not all(_object_sha(payload[name]) for name in ("sourceSha", "targetSha", "expectedTreeSha"))
+            or len({len(payload[name]) for name in ("sourceSha", "targetSha", "expectedTreeSha")}) != 1
+            or payload["sourceSha"] == payload["targetSha"] or payload["validationProfile"] != "full-verify"):
+        raise GateDenied("malformed_merge_plan")
     for name in ("taskId", "grantId", "operationId", "destinationId", "keyId"):
         if not _text(payload[name], _ID):
             raise GateDenied("malformed_ticket")
@@ -217,12 +257,25 @@ def validate(ticket: dict[str, Any], key: bytes, context: GateContext,
     if not hmac.compare_digest(expected, signature):
         raise GateDenied("invalid_signature")
     if (context.job != jobs[0] or context.project_id != payload["projectId"]
-            or context.source_sha != payload["sourceSha"]
+            or (version == 1 and context.source_sha != payload["sourceSha"])
             or context.destination_id != payload["destinationId"]
             or context.environment != payload["environment"]
             or context.key_id != payload["keyId"]
             or ("buildId" in payload and context.build_id != payload["buildId"])):
         raise GateDenied("context_mismatch")
+    if version == 2:
+        if (not all(_object_sha(value) for value in (context.source_sha, context.approved_source_sha, context.target_sha))
+                or context.approved_source_sha != payload["sourceSha"] or context.target_sha != payload["targetSha"]
+                or len(context.source_sha) != len(payload["sourceSha"])
+                or context.source_sha in (payload["sourceSha"], payload["targetSha"])
+                or type(context.parents) is not tuple or len(context.parents) != 2
+                or context.parents != (payload["targetSha"], payload["sourceSha"])):
+            raise GateDenied("merge_context_mismatch")
+        if not preparation and (not _object_sha(context.tree_sha) or context.tree_sha != payload["expectedTreeSha"]
+                or context.verification_source_sha != context.source_sha
+                or context.verification_profile != payload["validationProfile"]
+                or context.verification_passed is not True):
+            raise GateDenied("merge_proof_required")
     checked = _clock(now)
     if checked < issued:
         raise GateDenied("future_ticket")
@@ -233,8 +286,8 @@ def validate(ticket: dict[str, Any], key: bytes, context: GateContext,
     if any(start <= checked < end for start, end in windows):
         raise GateDenied("frozen")
     deadline = min([expiry] + [start for start, _ in windows if checked < start])
-    return {
-        "valid": True, "version": 1, "taskId": payload["taskId"],
+    result = {
+        "valid": True, "version": version, "taskId": payload["taskId"],
         "grantId": payload["grantId"], "operationId": payload["operationId"],
         "keyId": context.key_id, "projectId": context.project_id,
         "sourceSha": context.source_sha, "environment": context.environment,
@@ -243,6 +296,14 @@ def validate(ticket: dict[str, Any], key: bytes, context: GateContext,
         "checkedAt": _stamp(checked), "admissionDeadline": _stamp(deadline),
         "admissionOnly": True, "postAdmissionCancellation": False,
     }
+    if version == 2:
+        result.update(approvedSourceSha=payload["sourceSha"], deployedSha=context.source_sha,
+                      targetSha=payload["targetSha"], expectedTreeSha=payload["expectedTreeSha"],
+                      parents=list(context.parents), validationProfile=payload["validationProfile"])
+        if not preparation:
+            result.update(treeSha=context.tree_sha, verificationPassed=True,
+                          verificationSourceSha=context.verification_source_sha)
+    return result
 
 
 def _parts(path: str) -> list[str]:

@@ -175,6 +175,56 @@ describe('managed runner uses live controller authority and host-owned receipts'
     expect(transport.observe).not.toHaveBeenCalled(); expect(transport.dispatch).not.toHaveBeenCalled()
   })
 
+  it.each(['success', 'unknown'] as const)('public merge prepares once (%s response), and ambiguous preparation needs explicit host reconciliation', async preparationResponse => {
+    const f = fixture(), ci = hash('stages: [test]\n'), target = 'a'.repeat(40), resultSha = 'b'.repeat(40), resultTree = 'c'.repeat(40)
+    f.config.releasePolicy = { version: 1, enabled: true, maxGrantSeconds: 3600, freezeWindows: [], repositories: { app: { alias: 'app', root: f.repo, projectId: 17, projectPath: 'mate/app', host: 'git.example.test', apiOrigin: 'https://git.example.test', expectedUserId: 9, expectedUsername: 'bot', credentialFile: join(f.root, 'not-read-secret'), targetBranch: 'develop', mergeMode: 'merge-commit', ciSha256: ci, requiredJobs: ['check'], mergeTriggersDeploy: false, triggerPolicy: { reviewedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: future(), productionExcluded: true, fingerprint: 'reviewed' }, environments: {} } } }
+    let snapshot: RemoteSnapshot | undefined
+    const transport: ReleaseTransport = {
+      observe: vi.fn(async () => structuredClone(snapshot!)),
+      planMerge: vi.fn(async context => ({ version: 2 as const, sourceSha: context.request.sha, targetSha: target, expectedTreeSha: resultTree, ciSha256: ci, validationProfile: 'full-verify' as const })),
+      dispatch: vi.fn(async context => {
+        context.assertAuthorized()
+        if (context.request.action === 'prepare_merge') {
+          snapshot!.preparation = { plan: context.operation.mergePlan!, operationId: context.operation.id, metadataDigest: 'd'.repeat(64), expiresAt: context.deadline, verified: true }
+          if (preparationResponse === 'unknown') throw new Error('lost metadata response')
+        }
+        if (context.request.action === 'merge') { snapshot!.targetSha = resultSha; Object.assign(snapshot!.mergeRequest!, { state: 'merged', mergeCommitSha: resultSha, mergeCommitVerified: true, mergeTreeSha: resultTree, mergeParents: [target, context.request.sha] }) }
+        return { remoteIds: [`fake:${context.request.action}`], detail: 'fake accepted' }
+      }),
+    }
+    let controller: NightController | undefined
+    const runner = f.wrap({ snapshot: () => controller?.snapshot(), isAuthorized: () => true }, { transport })
+    controller = createController(f.config, runner); controllers.push(controller)
+    await controller.handle(message(), { type: 'enqueue', text: 'Authorized ordinary fixture merge', repositories: ['app'], access: 'write' })
+    const taskId = controller.snapshot().tasks[0]!.id
+    await controller.handle(message(), { type: 'approve', taskId })
+    await controller.handle(message(), { type: 'authorize-actions', taskId, actions: ['validate', 'commit'] })
+    await controller.handle(message(), { type: 'authorize-release', taskId, expiresAt: future(), scopes: [{ repository: 'app', sourceBranch: 'sdd/managed-fixture', targetBranch: 'develop', baseSha: f.base, actions: ['merge'] }] })
+    await controller.handle(message(), { type: 'start', deadline: future() })
+    const launch = await f.launched.promise
+    writeFileSync(join(f.repo, 'VALUE.txt'), 'after\n')
+    expect((await rpc(launch.policy.hostActions, { action: 'validate', repository: 'app', recipe: 'check' })).result.outcome).toBe('succeeded')
+    const committed = await rpc(launch.policy.hostActions, { action: 'commit', repository: 'app', message: 'test: prepare merge fixture' }), sha = committed.result.head as string
+    expect(committed.result.outcome).toBe('succeeded')
+    snapshot = { identity: { id: 9, username: 'bot' }, project: { id: 17, path: 'mate/app', defaultBranch: 'develop', pipelineRequired: true, mergeMethod: 'merge', fastForwardOnly: false }, sourceSha: sha, targetSha: target, targetCiSha256: ci, productionExcluded: true, triggerPolicyFingerprint: 'reviewed',
+      mergeRequest: { iid: 7, sourceProjectId: 17, targetProjectId: 17, sourceBranch: 'sdd/managed-fixture', targetBranch: 'develop', sha, state: 'opened', authorId: 9, draft: false, conflicts: false, mergeable: true, approved: true, unresolvedDiscussions: 0, marker: `nightshift:${taskId}:app:${sha}` },
+      pipeline: { id: 1, sha, status: 'success', jobs: [{ name: 'check', status: 'success', allowFailure: false }] } }
+    expect((await rpc(launch.policy.hostActions, { action: 'prepare_merge', repository: 'app', sha }, 'release')).ok).toBe(false)
+    if (preparationResponse === 'unknown') {
+      expect((await rpc(launch.policy.hostActions, { action: 'merge', repository: 'app', sha }, 'release')).result).toMatchObject({ status: 'unknown', remoteActive: true })
+      expect(transport.dispatch).toHaveBeenCalledTimes(1)
+      expect((await rpc(launch.policy.hostActions, { action: 'merge', repository: 'app', sha }, 'release')).result.status).toBe('unknown')
+      expect(transport.dispatch).toHaveBeenCalledTimes(1)
+      const prep = runner.operations()[0]!
+      expect((await runner.reconcile(prep.id, new AbortController().signal)).status).toBe('succeeded')
+    }
+    expect((await rpc(launch.policy.hostActions, { action: 'merge', repository: 'app', sha }, 'release')).result).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(runner.operations().map(operation => [operation.action, operation.state])).toEqual([['prepare_merge', 'succeeded'], ['merge', 'succeeded']])
+    expect((await rpc(launch.policy.hostActions, { action: 'merge', repository: 'app', sha }, 'release')).result.status).toBe('succeeded')
+    expect(transport.planMerge).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(transport.dispatch).mock.calls.map(([context]) => context.request.action)).toEqual(['prepare_merge', 'merge'])
+  })
+
   it('persisted remote activity blocks preflight until read-only fake transport reconciliation proves terminal state', async () => {
     const f = fixture(), sha = 'a'.repeat(40), ci = 'b'.repeat(64)
     const policy: ReleasePolicy = { version: 1, enabled: true, maxGrantSeconds: 3600, freezeWindows: [], repositories: { app: { alias: 'app', root: f.repo, projectId: 17, projectPath: 'mate/app', host: 'git.example.test', apiOrigin: 'https://git.example.test', expectedUserId: 9, expectedUsername: 'bot', credentialFile: join(f.root, 'not-read-secret'), targetBranch: 'develop', ciSha256: ci, requiredJobs: ['check'], mergeTriggersDeploy: false, pushHasNoRemoteJobs: true, triggerPolicy: { reviewedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: future(), productionExcluded: true, fingerprint: 'reviewed' }, environments: {} } } }

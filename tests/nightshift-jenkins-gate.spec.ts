@@ -18,9 +18,13 @@ interface Payload {
   sourceSha: string; environment: string; jobs: string[]; destinationId: string
   issuedAt: string; notBefore: string; expiresAt: string
   freezeWindows: { from: string; until: string }[]; keyId: string; nonce: string; buildId?: string
+  targetSha?: string; expectedTreeSha?: string; validationProfile?: string
 }
 interface Envelope { payload: Payload; signature: string }
-interface Context { job: string; build_id: string; source_sha: string; project_id: number; destination_id: string; environment: string; key_id: string }
+interface Context { job: string; build_id: string; source_sha: string; project_id: number; destination_id: string; environment: string; key_id: string
+  approved_source_sha?: string | null; target_sha?: string | null; tree_sha?: string | null; parents?: string[] | null
+  verification_source_sha?: string | null; verification_profile?: string | null; verification_passed?: boolean | number | string | null
+}
 function payload(overrides: Partial<Payload> = {}): Payload {
   return {
     version: 1, taskId: 'task-13', grantId: 'grant-01', operationId: 'operation-01',
@@ -90,11 +94,15 @@ spec.loader.exec_module(g)
 data = json.load(sys.stdin)
 key = bytes.fromhex(data["key"])
 try:
+    if type(data['context'].get('parents')) is list and not data.get('mutableParents'):
+        data['context']['parents'] = tuple(data['context']['parents'])
     ctx = g.GateContext(**data["context"]) if not data.get("untypedContext") else data["context"]
     now = datetime.fromisoformat(data["now"].replace("Z", "+00:00"))
     mode = data.get("mode", "validate")
     if mode == "validate":
         result = g.validate(data["ticket"], key, ctx, now)
+    elif mode == 'prepare':
+        result = g.validate_preparation(data['ticket'], key, ctx, now)
     else:
         samples = iter([datetime.fromisoformat(v.replace("Z", "+00:00")) for v in data.get("samples", [data["now"], data["now"]])])
         if data.get("failFsync"):
@@ -106,7 +114,7 @@ try:
 except g.GateDenied as e:
     print(json.dumps({"allowed": False, "reason": str(e)}))
 `
-function pure(options: { ticket?: unknown; context?: Context; now?: string; key?: Buffer; mode?: string; state?: string; samples?: string[]; failFsync?: boolean; untypedContext?: boolean } = {}) {
+function pure(options: { ticket?: unknown; context?: Context; now?: string; key?: Buffer; mode?: string; state?: string; samples?: string[]; failFsync?: boolean; untypedContext?: boolean; mutableParents?: boolean } = {}) {
   const input = { ticket: sign(), context: context(), now: '2026-11-10T01:00:00Z', ...options, key: (options.key ?? key).toString('hex') }
   const result = spawnSync('python3', ['-I', '-B', '-c', driver, gate], {
     input: JSON.stringify(input), encoding: 'utf8', env, timeout: 10_000, maxBuffer: 128_000,
@@ -445,5 +453,102 @@ describe('Jenkins gate CLI files, path boundaries and no secret output', () => {
       cliDenied(changed(f.args, flag!, value!), 'context_mismatch')
     }
     expect(readdirSync(f.state)).toEqual([])
+  })
+})
+
+const mergedSha = 'b'.repeat(40), targetSha = 'c'.repeat(40), treeSha = 'd'.repeat(40)
+const v2Payload = (change: Partial<Payload> = {}) => payload({ version: 2, targetSha, expectedTreeSha: treeSha, validationProfile: 'full-verify', ...change })
+const v2Context = (change: Partial<Context> = {}) => context({ source_sha: mergedSha, approved_source_sha: sha,
+  target_sha: targetSha, tree_sha: treeSha, parents: [targetSha, sha], verification_source_sha: mergedSha,
+  verification_profile: 'full-verify', verification_passed: true, ...change })
+
+describe('v2 signed ordinary-merge admission proof', () => {
+  it('retains the fixed pre-v2 golden HMAC bytes and v1 result contract', () => {
+    const ticket = sign(payload())
+    expect(ticket.signature).toBe('dacdbc5d4b709c3ed2de79036ea6341dd47970de92b56032ec2e7350f1332b93')
+    const out = pure({ ticket })
+    expect(out.version).toBe(1)
+    expect(out.sourceSha).toBe(sha)
+    for (const field of ['approvedSourceSha', 'deployedSha', 'parents', 'expectedTreeSha', 'treeSha', 'verificationPassed']) expect(out).not.toHaveProperty(field)
+  })
+  it('binds approved S, target T, actual M parents and exact tree plus full verification', () => {
+    const out = pure({ ticket: sign(v2Payload()), context: v2Context() })
+    expect(out).toMatchObject({ valid: true, version: 2, sourceSha: mergedSha, deployedSha: mergedSha,
+      approvedSourceSha: sha, targetSha, treeSha, expectedTreeSha: treeSha, parents: [targetSha, sha],
+      validationProfile: 'full-verify', verificationPassed: true, verificationSourceSha: mergedSha,
+      admissionOnly: true, postAdmissionCancellation: false })
+    expect(out).not.toHaveProperty('allowed')
+  })
+  it('controller preparation authenticates plan/parents but never claims local tree/tests succeeded', () => {
+    const c = v2Context({ tree_sha: null, verification_source_sha: null, verification_profile: null, verification_passed: null })
+    const out = pure({ ticket: sign(v2Payload()), context: c, mode: 'prepare' })
+    expect(out).toMatchObject({ prepared: true, proofPending: true, version: 2, expectedTreeSha: treeSha })
+    for (const k of ['valid', 'allowed', 'treeSha', 'verificationPassed', 'verificationSourceSha']) expect(out).not.toHaveProperty(k)
+    denied(pure({ ticket: sign(v2Payload()), context: c }), 'merge_proof_required')
+  })
+  it.each(['targetSha', 'expectedTreeSha', 'validationProfile'])('HMAC covers v2 %s without altering v1 canonical format', field => {
+    const ticket = sign(v2Payload())
+    ;(ticket.payload as unknown as Record<string, unknown>)[field] = field === 'validationProfile' ? 'build-only' : 'e'.repeat(40)
+    denied(pure({ ticket, context: v2Context() }))
+  })
+  it.each<Partial<Context>>([
+    { source_sha: sha }, { source_sha: targetSha }, { source_sha: '0'.repeat(40) }, { source_sha: 'b'.repeat(64) },
+    { approved_source_sha: null }, { approved_source_sha: 'e'.repeat(40) }, { target_sha: null }, { target_sha: 'e'.repeat(40) },
+    { parents: null }, { parents: [sha, targetSha] }, { parents: [targetSha] }, { parents: [targetSha, sha, 'e'.repeat(40)] },
+    { parents: [targetSha, targetSha] }, { parents: ['0'.repeat(40), sha] },
+    { tree_sha: null }, { tree_sha: 'e'.repeat(40) }, { tree_sha: '0'.repeat(40) },
+    { verification_source_sha: null }, { verification_source_sha: sha },
+    { verification_profile: null }, { verification_profile: 'package-only' },
+    { verification_passed: false }, { verification_passed: null }, { verification_passed: 1 }, { verification_passed: 'true' },
+  ])('rejects incomplete/mismatched local proof %j without consuming intent', change => {
+    const { state } = temp()
+    denied(pure({ ticket: sign(v2Payload()), context: v2Context(change), mode: 'admit', state }))
+    expect(readdirSync(state)).toEqual([])
+  })
+  it('requires immutable typed parents rather than trusting a mutable untyped list', () => {
+    denied(pure({ ticket: sign(v2Payload()), context: v2Context(), mutableParents: true }), 'merge_context_mismatch')
+  })
+  it.each<Partial<Payload>>([
+    { targetSha: sha }, { targetSha: '0'.repeat(40) }, { expectedTreeSha: '0'.repeat(40) },
+    { sourceSha: '0'.repeat(40) }, { expectedTreeSha: 'd'.repeat(64) }, { validationProfile: 'package-only' },
+    { validationProfile: 'FULL-VERIFY' },
+  ])('rejects signed invalid merge plans %j', change => {
+    denied(pure({ ticket: sign(v2Payload(change)), context: v2Context() }), 'malformed_merge_plan')
+  })
+  it.each(['targetSha', 'expectedTreeSha', 'validationProfile'])('fails closed on missing v2 %s', field => {
+    const value = v2Payload() as unknown as Record<string, unknown>; delete value[field]
+    denied(pure({ ticket: sign(value as unknown as Payload), context: v2Context() }), 'malformed_ticket')
+  })
+  it('does not accept extra mergeMode/preparationId or silently downgrade v2 to v1', () => {
+    for (const field of ['mergeMode', 'preparationId']) {
+      denied(pure({ ticket: sign({ ...v2Payload(), [field]: 'not-in-contract' }), context: v2Context() }), 'malformed_ticket')
+    }
+    denied(pure({ ticket: sign(v2Payload({ version: 1 })), context: v2Context() }), 'malformed_ticket')
+    denied(pure({ ticket: sign(payload()), context: v2Context() }), 'context_mismatch')
+  })
+  it('v2 CLI has no proof parameter bypass and denies without trusted object/audit proof', () => {
+    const f = fixture(v2Payload())
+    cliDenied(changed(f.args, '--source-sha', mergedSha), 'merge_context_mismatch')
+    expect(readdirSync(f.state)).toEqual([])
+  })
+  it('single-use receipt HMAC binds actual merge proof and denies retry or version downgrade', () => {
+    const { state } = temp(), ticket = sign(v2Payload())
+    const out = pure({ mode: 'admit', state, ticket, context: v2Context() })
+    expect(out.allowed).toBe(true)
+    for (const path of readdirSync(state)) {
+      const receipt = JSON.parse(readFileSync(join(state, path), 'utf8'))
+      expect(receipt.receipt.metadata).toMatchObject({ sourceSha: mergedSha, approvedSourceSha: sha, treeSha, parents: [targetSha, sha], verificationPassed: true })
+      expect(receipt.signature).toBe(createHmac('sha256', key).update('nightshift-gate-receipt-v1\0').update(canonical(receipt.receipt)).digest('hex'))
+    }
+    denied(pure({ mode: 'admit', state, ticket, context: v2Context() }), 'replay_or_unknown')
+    denied(pure({ mode: 'admit', state, ticket: sign(payload({ nonce: 'Z'.repeat(43) })) }), 'replay_or_unknown')
+  })
+  it('v2 still rechecks expiry/freeze after durable claim with no post-admission stop promise', () => {
+    const { state } = temp()
+    denied(pure({ mode: 'admit', state, ticket: sign(v2Payload()), context: v2Context(),
+      samples: ['2026-11-10T01:59:59.999999Z', '2026-11-10T02:00:00Z'] }), 'expired')
+    expect(readdirSync(state)).toHaveLength(2)
+    const p = v2Payload({ issuedAt: '2026-11-12T00:00:00+08:00', notBefore: '2026-11-12T00:00:00+08:00', expiresAt: '2026-11-12T02:00:00+08:00' })
+    denied(pure({ ticket: sign(p), context: v2Context(), now: '2026-11-12T01:00:00+08:00' }), 'frozen')
   })
 })

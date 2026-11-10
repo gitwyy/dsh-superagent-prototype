@@ -7,7 +7,7 @@ import { createReleaseServices, type ReleaseServices, type ReleaseServicesOption
 import { policyDigest } from '../src/nightshift/release/coordinator.ts'
 import type { DeploymentTicketEvidence, DeploymentTickets } from '../src/nightshift/release/deployment-tickets.ts'
 import type { GitlabTransportOptions } from '../src/nightshift/release/gitlab.ts'
-import type { DispatchContext, ReleaseTransport, RemoteSnapshot } from '../src/nightshift/release/contracts.ts'
+import type { DispatchContext, MergePlan, ReleaseTransport, RemoteSnapshot } from '../src/nightshift/release/contracts.ts'
 import type { NightConfig } from '../src/nightshift/contracts.ts'
 
 const roots: string[] = [], services: ReleaseServices[] = []
@@ -164,6 +164,90 @@ describe('fresh private operator attestation and signed scope binding', () => {
     expect(result.deployment!.state).toBe('absent')
     expect(JSON.stringify(result)).not.toContain(h.runtime.attestationFile)
     expect(JSON.stringify(result)).not.toContain(h.runtime.keyFile)
+  })
+})
+
+describe('ordinary merge preparation composition', () => {
+  function ordinary() {
+    const h = fixture(), plan: MergePlan = { version: 2, sourceSha: SHA, targetSha: BASE, expectedTreeSha: 'd'.repeat(40), ciSha256: HASH, validationProfile: 'full-verify' }
+    h.context.repository.mergeMode = 'merge-commit'
+    const digest = policyDigest(h.config.releasePolicy!)
+    h.context.grant.policyDigest = h.context.operation.policyDigest = digest; h.evidence().policyDigest = digest
+    h.context.operation.mergePlan = plan; h.context.operation.preparationId = 'prepare-op'
+    const evidence = h.evidence(); evidence.mergePlan = plan; evidence.operationId = 'prepare-op'; evidence.metadata = 'signed-v2'; evidence.metadataDigest = HASH
+    evidence.jobTickets[JOB]!.payload = { ...evidence.jobTickets[JOB]!.payload, version: 2, targetSha: BASE, expectedTreeSha: plan.expectedTreeSha, validationProfile: 'full-verify', operationId: 'prepare-op' }
+    h.context.snapshot.preparation = { plan, operationId: 'prepare-op', metadataDigest: HASH, expiresAt: h.context.deadline, verified: true }
+    const baseObserver = h.observer
+    h.options.observer = async (...args) => {
+      const result = await baseObserver(...args), attestation = await args[3]!.attest!(args[0])
+      if (result.deployment && attestation?.mergePlan) { result.deployment.approvedSourceSha = SHA; result.deployment.mergePlan = attestation.mergePlan }
+      return result
+    }
+    return { ...h, plan }
+  }
+
+  it('exposes read-only private evidence independent of request action and passes planning through without Jenkins', async () => {
+    const h = ordinary(); h.gitlab.planMerge = vi.fn(async () => h.plan)
+    const service = h.create(), signal = new AbortController().signal
+    expect(await h.captured().deploymentTickets!.evidence!('task-1', 'app', SHA)).toEqual(h.evidence())
+    expect(await service.transport.planMerge!(h.context, signal)).toEqual(h.plan)
+    expect(h.gitlab.planMerge).toHaveBeenCalledWith(expect.objectContaining({ request: h.context.request }), expect.any(AbortSignal))
+    expect(h.observer).not.toHaveBeenCalled()
+  })
+
+  it('creates ordinary MR without signing or requiring local deployment attestation', async () => {
+    const h = ordinary(), service = h.create()
+    h.document.expiresAt = future(-1); h.save()
+    const context = { ...h.context, request: { ...h.context.request, action: 'create_mr' as const }, operation: { ...h.context.operation, action: 'create_mr' as const } }
+    expect(await h.captured().deploymentTickets!.metadata(context)).toBe('')
+    await expect(service.transport.dispatch(context, new AbortController().signal)).resolves.toMatchObject({ remoteIds: ['fake-accepted'] })
+    expect(h.tickets.metadata).not.toHaveBeenCalled(); expect(h.observer).not.toHaveBeenCalled()
+  })
+
+  it('skips Jenkins overlay for prepare GET while preserving GitLab preparation evidence', async () => {
+    const h = ordinary(), service = h.create()
+    const context = { ...h.context, request: { ...h.context.request, action: 'prepare_merge' as const } }
+    expect(await service.transport.observe(context, new AbortController().signal)).toEqual(h.context.snapshot)
+    expect(h.observer).not.toHaveBeenCalled()
+  })
+
+  it('signs prepare metadata under a final synchronous local-attestation guard before PUT', async () => {
+    const h = ordinary(), service = h.create(), mutation = vi.fn()
+    vi.mocked(h.gitlab.dispatch).mockImplementationOnce(async context => {
+      await h.captured().deploymentTickets!.metadata(context)
+      h.document.expiresAt = future(-1); h.save()
+      context.assertAuthorized(); mutation()
+      return { remoteIds: ['must-not-write'], detail: '' }
+    })
+    const context = { ...h.context, request: { ...h.context.request, action: 'prepare_merge' as const }, operation: { ...h.context.operation, id: 'prepare-op', action: 'prepare_merge' as const } }
+    await expect(service.transport.dispatch(context, new AbortController().signal)).rejects.toThrow()
+    expect(h.tickets.metadata).toHaveBeenCalledTimes(1); expect(mutation).not.toHaveBeenCalled()
+  })
+
+  it('passes signed private plan into observer and dispatches only an empty exact preparation snapshot', async () => {
+    const h = ordinary(), service = h.create()
+    await expect(service.transport.dispatch(h.context, new AbortController().signal)).resolves.toMatchObject({ remoteIds: ['fake-accepted'] })
+    expect(h.gitlab.dispatch).toHaveBeenCalledWith(expect.objectContaining({ snapshot: expect.objectContaining({ preparation: h.context.snapshot.preparation,
+      deployment: expect.objectContaining({ state: 'absent', approvedSourceSha: SHA, mergePlan: h.plan }) }) }), expect.any(AbortSignal))
+  })
+
+  it.each(['target', 'source', 'prep-id', 'prep-plan', 'expired', 'unverified', 'wrong-ticket-version', 'wrong-ticket-tree', 'known-build'] as const)('blocks ordinary merge on %s drift before external mutation', async invalid => {
+    const h = ordinary()
+    if (invalid === 'target') h.context.snapshot.targetSha = 'f'.repeat(40)
+    if (invalid === 'source') h.context.snapshot.sourceSha = BASE
+    if (invalid === 'prep-id') h.context.snapshot.preparation!.operationId = 'wrong-op'
+    if (invalid === 'prep-plan') h.context.snapshot.preparation!.plan = { ...h.plan, expectedTreeSha: 'f'.repeat(40) }
+    if (invalid === 'expired') h.context.snapshot.preparation!.expiresAt = future(-1)
+    if (invalid === 'unverified') h.context.snapshot.preparation!.verified = false
+    if (invalid === 'wrong-ticket-version') Object.assign(h.evidence().jobTickets[JOB]!.payload, { version: 1 })
+    if (invalid === 'wrong-ticket-tree') Object.assign(h.evidence().jobTickets[JOB]!.payload, { expectedTreeSha: 'f'.repeat(40) })
+    if (invalid === 'known-build') {
+      const observer = h.options.observer!
+      h.options.observer = async (...args) => { const result = await observer(...args); result.deployment!.ids = ['existing-build']; return result }
+    }
+    const service = h.create()
+    await expect(service.transport.dispatch(h.context, new AbortController().signal)).rejects.toThrow()
+    expect(h.gitlab.dispatch).not.toHaveBeenCalled()
   })
 })
 

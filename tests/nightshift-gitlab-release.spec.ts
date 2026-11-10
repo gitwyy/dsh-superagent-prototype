@@ -50,8 +50,8 @@ async function fixture() {
 }
 function apiStub(f: Awaited<ReturnType<typeof fixture>>) {
   const calls: { method: string; path: string; body?: Record<string, unknown>; token?: string }[] = []
-  const state = { source: sha as string | undefined, target: base, ff: true, approvals: true, unresolved: false, foreign: false, duplicate: false, pipelineSha: sha, job: 'success', jobAllowFailure: false, merged: false, mr: true, mutateFailure: false, finalTargetDrift: false, targetReads: 0 }
-  const mr = () => ({ iid: 9, source_project_id: 451, target_project_id: 451, source_branch: 'sdd/task', target_branch: 'master', author: { id: state.foreign ? 99 : 71 }, sha, state: state.merged ? 'merged' : 'opened', description: releaseMarker('task-1', 'app', sha), draft: false, has_conflicts: false, detailed_merge_status: 'mergeable', squash: false, squash_on_merge: false, head_pipeline: { id: 21 }, ...(state.merged ? { merge_commit_sha: sha } : {}) })
+  const state = { source: sha as string | undefined, target: base, ff: true, approvals: true, unresolved: false, foreign: false, duplicate: false, pipelineSha: sha, job: 'success', jobAllowFailure: false, merged: false, mr: true, mutateFailure: false, finalTargetDrift: false, targetReads: 0, description: releaseMarker('task-1', 'app', sha), mergedSha: sha, parents: [base] }
+  const mr = () => ({ iid: 9, source_project_id: 451, target_project_id: 451, source_branch: 'sdd/task', target_branch: 'master', author: { id: state.foreign ? 99 : 71 }, sha, state: state.merged ? 'merged' : 'opened', description: state.description, draft: false, has_conflicts: false, detailed_merge_status: 'mergeable', squash: false, squash_on_merge: false, head_pipeline: { id: 21 }, ...(state.merged ? { merge_commit_sha: state.mergedSha } : {}) })
   const fetcher: typeof fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input)); const method = init?.method ?? 'GET'
     calls.push({ method, path: url.pathname + url.search, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}), token: new Headers(init?.headers).get('PRIVATE-TOKEN') ?? undefined })
@@ -59,6 +59,7 @@ function apiStub(f: Awaited<ReturnType<typeof fixture>>) {
     const p = url.pathname
     if (method !== 'GET') {
       if (state.mutateFailure) throw new Error('fixture-token-never-live disconnected')
+      if (method === 'PUT' && p.endsWith('/merge_requests/9') && init?.body) state.description = JSON.parse(String(init.body)).description
       return json(method === 'POST' ? { iid: 9 } : mr())
     }
     if (p === '/api/v4/user') return json({ id: 71, username: 'project_bot', state: 'active' })
@@ -74,7 +75,7 @@ function apiStub(f: Awaited<ReturnType<typeof fixture>>) {
     if (p.endsWith('/pipelines/21')) return json({ id: 21, project_id: 451, sha: state.pipelineSha, source: 'merge_request_event', status: 'success' })
     if (p.endsWith('/jobs')) return json([{ name: 'test', status: state.job, allow_failure: state.jobAllowFailure, pipeline: { id: 21 } }], 200, { 'x-next-page': '' })
     if (p.endsWith('/bridges')) return json([], 200, { 'x-next-page': '' })
-    if (p.includes('/repository/commits/')) return json({ id: sha, parent_ids: [base] })
+    if (p.includes('/repository/commits/')) return json({ id: state.merged ? state.mergedSha : sha, parent_ids: state.parents })
     throw new Error(`Unexpected fixture route ${p}`)
   }
   return { calls, state, fetcher }
@@ -85,6 +86,34 @@ async function dispatchContext(f: Awaited<ReturnType<typeof fixture>>, transport
 }
 
 describe('typed GitLab release transport (local HTTP/stubs only)', () => {
+  it('journals ordinary preparation separately and verifies actual remote merge parents/tree without source equality', async () => {
+    const f = await fixture(); f.repository.mergeMode = 'merge-commit'; const stub = apiStub(f); stub.state.ff = false; stub.state.target = 'c'.repeat(40)
+    const plan = { version: 2 as const, sourceSha: sha, targetSha: stub.state.target, expectedTreeSha: 'd'.repeat(40), ciSha256: ciSha, validationProfile: 'full-verify' as const }
+    const objects = { plan: async () => plan, readCommit: async () => ({ treeSha: plan.expectedTreeSha, parents: [plan.targetSha, sha] }) }
+    const transport = createGitlabTransport({ tempRoot: f.tempRoot, fetch: stub.fetcher, mergeObjects: objects })
+    const ctx = await dispatchContext(f, transport); ctx.request = { ...ctx.request, action: 'prepare_merge' }; ctx.operation = { ...ctx.operation, action: 'prepare_merge', mergePlan: plan }
+    expect(await transport.planMerge!({ ...f, candidate: ctx.candidate, snapshot: ctx.snapshot }, new AbortController().signal)).toEqual(plan)
+    await transport.dispatch(ctx, new AbortController().signal)
+    expect(stub.calls.filter(x => x.method !== 'GET').map(x => x.path)).toEqual(['/api/v4/projects/451/merge_requests/9'])
+    const ready = await transport.observe(ctx, new AbortController().signal)
+    expect(ready.preparation).toMatchObject({ operationId: 'op-1', plan, verified: true })
+    const merge = { ...ctx, request: { ...ctx.request, action: 'merge' as const }, operation: { ...ctx.operation, id: 'merge-1', action: 'merge' as const, preparationId: 'op-1' }, snapshot: ready }
+    await transport.dispatch(merge, new AbortController().signal)
+    expect(stub.calls.filter(x => x.method !== 'GET').map(x => x.path)).toEqual(['/api/v4/projects/451/merge_requests/9', '/api/v4/projects/451/merge_requests/9/merge'])
+    stub.state.merged = true; stub.state.mergedSha = 'e'.repeat(40); stub.state.target = stub.state.mergedSha; stub.state.parents = [plan.targetSha, sha]
+    expect((await transport.observe(merge, new AbortController().signal)).mergeRequest).toMatchObject({ sha, mergeCommitSha: stub.state.mergedSha, mergeTreeSha: plan.expectedTreeSha, mergeParents: [plan.targetSha, sha], mergeCommitVerified: true })
+    stub.state.parents = ['f'.repeat(40), sha]
+    await expect(transport.observe(merge, new AbortController().signal)).rejects.toThrow('parents or tree differ')
+  })
+  it('does not mint ordinary-merge tickets during createMR and allows target advance for nonmerge writes', async () => {
+    const f = await fixture(); f.repository.mergeMode = 'merge-commit'; f.repository.mergeTriggersDeploy = true; f.request.action = 'create_mr'
+    const stub = apiStub(f); stub.state.ff = false; stub.state.mr = false; let signed = 0
+    const transport = createGitlabTransport({ tempRoot: f.tempRoot, fetch: stub.fetcher, deploymentTickets: { metadata: async () => { signed++; return 'must-not-sign' }, verify: async () => {} } })
+    const ctx = await dispatchContext(f, transport); stub.state.target = 'e'.repeat(40)
+    await transport.dispatch(ctx, new AbortController().signal)
+    expect(signed).toBe(0); expect(stub.calls.filter(x => x.method !== 'GET')).toHaveLength(1)
+    expect(String(stub.calls.at(-1)?.body?.description)).not.toContain('superagent-deploy')
+  })
   it('pins secret-file identity/mode and denies HTTP by default', async () => {
     const f = await fixture(); expect((await readReleaseCredential(f.repository)).userId).toBe(71)
     f.repository.apiOrigin = 'http://gitlab.invalid'

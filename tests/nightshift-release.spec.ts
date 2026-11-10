@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createReleaseCoordinator, policyDigest, type ReleaseCoordinator } from '../src/nightshift/release/coordinator.ts'
 import { ReleaseJournal, type ReleaseIntent } from '../src/nightshift/release/journal.ts'
-import { releaseMarker, type CandidateEvidence, type ReleaseAuthority, type ReleaseGrant, type ReleasePolicy, type ReleaseRequest, type ReleaseTransport, type RemoteSnapshot } from '../src/nightshift/release/contracts.ts'
+import { releaseMarker, type MergePlan, type CandidateEvidence, type ReleaseAuthority, type ReleaseGrant, type ReleasePolicy, type ReleaseRequest, type ReleaseTransport, type RemoteSnapshot } from '../src/nightshift/release/contracts.ts'
 
 const SHA = 'a'.repeat(40), BASE = 'b'.repeat(40), TREE = 'c'.repeat(40), CI = 'd'.repeat(64), JOB = 'e'.repeat(64)
 const roots: string[] = [], coordinators: ReleaseCoordinator[] = []
@@ -45,6 +45,30 @@ function harnessAwaiting() {
   h.policy.repositories.repo!.environments.test!.expectedConfigSha256['test-deploy-two'] = JOB
   h.mr(); h.route(); h.snapshot.deployment!.configSha256!['test-deploy-two'] = JOB
   return { ...h, controller: h.create() }
+}
+function ordinaryFixture(deploy = false) {
+  const h = fixture(), target = 'f'.repeat(40), mergedSha = '1'.repeat(40), mergedTree = '2'.repeat(40)
+  h.policy.repositories.repo!.mergeMode = 'merge-commit'; h.policy.repositories.repo!.mergeTriggersDeploy = deploy
+  h.mr(); h.snapshot.project.fastForwardOnly = false; h.snapshot.project.mergeMethod = 'merge'; h.snapshot.targetSha = target
+  const plan: MergePlan = { version: 2, sourceSha: SHA, targetSha: target, expectedTreeSha: mergedTree, ciSha256: CI, validationProfile: 'full-verify' }
+  h.transport.planMerge = vi.fn(async () => structuredClone(plan))
+  vi.mocked(h.transport.dispatch).mockImplementation(async context => {
+    context.assertAuthorized()
+    if (context.request.action === 'prepare_merge') {
+      h.snapshot.preparation = { plan: structuredClone(context.operation.mergePlan!), metadataDigest: '3'.repeat(64), operationId: context.operation.id, expiresAt: context.deadline, verified: true }
+      if (deploy) { h.route(); h.snapshot.deployment!.approvedSourceSha = SHA; h.snapshot.deployment!.mergePlan = structuredClone(plan) }
+    }
+    return { remoteIds: [`${context.request.action}:accepted`], detail: 'fake acceptance only' }
+  })
+  const merged = () => {
+    h.snapshot.mergeRequest = { ...h.snapshot.mergeRequest!, state: 'merged', mergeCommitSha: mergedSha, mergeCommitVerified: true, mergeTreeSha: mergedTree, mergeParents: [target, SHA] }
+    h.snapshot.targetSha = mergedSha
+    if (deploy) {
+      h.snapshot.deployment = { ...h.snapshot.deployment!, sourceSha: mergedSha, approvedSourceSha: SHA, mergePlan: structuredClone(plan), state: 'running', ids: ['deploy-1'], healthy: false,
+        builds: [{ job: 'test-deploy', id: 'deploy-1', sha: mergedSha, destinationId: 'test-cluster', state: 'running', healthy: false }] }
+    }
+  }
+  return { ...h, target, mergedSha, mergedTree, plan, merged }
 }
 afterEach(async () => {
   for (const coordinator of coordinators.splice(0)) await coordinator.close()
@@ -375,6 +399,160 @@ describe('fresh authorization and serialized lifecycle', () => {
   })
 })
 
+describe('immutable ordinary merge preparation', () => {
+  async function ready(h: ReturnType<typeof ordinaryFixture>, c: ReleaseCoordinator) {
+    const result = await c.prepareMerge({ taskId: 'task-1', repository: 'repo', sha: SHA }, signal())
+    expect(result.status).toBe('accepted')
+    expect(await c.reconcile(result.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    return result.operationId!
+  }
+
+  it('allows genuine target divergence, journals separate metadata and merge, and verifies resulting M parents/tree', async () => {
+    const h = ordinaryFixture(), c = h.create()
+    expect(h.target).not.toBe(h.grant.scopes[0]!.baseSha)
+    expect((await c.execute(h.request('merge'), signal())).status).toBe('blocked')
+    const prepId = await ready(h, c)
+    expect(c.operations()).toHaveLength(1)
+    expect(c.operations()[0]).toMatchObject({ action: 'prepare_merge', mergePlan: h.plan })
+    const merged = await c.execute(h.request('merge'), signal())
+    expect(merged.status).toBe('accepted')
+    expect(c.operations()[1]).toMatchObject({ action: 'merge', sha: SHA, preparationId: prepId, mergePlan: h.plan })
+    expect(c.operations()[0]!.logicalKey).not.toBe(c.operations()[1]!.logicalKey)
+    h.merged()
+    expect(await c.reconcile(merged.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(vi.mocked(h.transport.dispatch).mock.calls.map(([context]) => context.request.action)).toEqual(['prepare_merge', 'merge'])
+  })
+
+  it.each(['plan', 'readback'] as const)('persists a local writer-unknown safety latch after %s, blocking repeats and reopen', async phase => {
+    const h = ordinaryFixture(), c = h.create(), error = Object.assign(new Error('local process group unverified'), { code: 'NIGHTSHIFT_WRITER_UNKNOWN', writerStopped: false, pgid: 12345 })
+    if (phase === 'plan') {
+      vi.mocked(h.transport.planMerge!).mockRejectedValueOnce(error)
+      await expect(c.prepareMerge(h.request(), signal())).rejects.toMatchObject({ code: 'NIGHTSHIFT_WRITER_UNKNOWN' })
+    } else {
+      const prepared = await c.prepareMerge(h.request(), signal())
+      vi.mocked(h.transport.observe).mockRejectedValueOnce(error)
+      await expect(c.reconcile(prepared.operationId!, signal())).rejects.toMatchObject({ code: 'NIGHTSHIFT_WRITER_UNKNOWN' })
+    }
+    expect(c.remoteActive()).toBe(true)
+    const calls = vi.mocked(h.transport.planMerge!).mock.calls.length
+    await c.prepareMerge(h.request(), signal())
+    await c.close(); const reopened = h.create()
+    expect(reopened.remoteActive()).toBe(true)
+    expect((await reopened.execute(h.request('merge'), signal())).status).toBe('blocked')
+    await reopened.prepareMerge(h.request(), signal())
+    expect(h.transport.planMerge).toHaveBeenCalledTimes(calls)
+    expect((await reopened.reconcile('any-operation', signal())).remoteActive).toBe(true)
+  })
+
+  it('publishes no second preparation even after target changes or reconstruction', async () => {
+    const h = ordinaryFixture(), c = h.create(), prepId = await ready(h, c)
+    h.snapshot.targetSha = '4'.repeat(40)
+    expect((await c.prepareMerge(h.request(), signal())).operationId).toBe(prepId)
+    expect((await c.execute(h.request('merge'), signal())).status).toBe('blocked')
+    await c.close(); const reopened = h.create()
+    expect((await reopened.prepareMerge(h.request(), signal())).operationId).toBe(prepId)
+    expect((await reopened.execute(h.request('merge'), signal())).status).toBe('blocked')
+    expect(h.transport.planMerge).toHaveBeenCalledTimes(1); expect(h.transport.dispatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('never retries unknown metadata publication and can reconcile exact immutable readback', async () => {
+    const h = ordinaryFixture(), c = h.create()
+    vi.mocked(h.transport.dispatch).mockImplementationOnce(async context => {
+      h.snapshot.preparation = { plan: context.operation.mergePlan!, metadataDigest: '3'.repeat(64), operationId: context.operation.id, expiresAt: context.deadline, verified: true }
+      throw new Error('response lost after metadata PUT')
+    })
+    const prep = await c.prepareMerge(h.request(), signal())
+    expect(prep).toMatchObject({ status: 'unknown', remoteActive: true })
+    await c.close(); const reopened = h.create()
+    expect(await reopened.prepareMerge(h.request(), signal())).toEqual(prep)
+    expect((await reopened.execute(h.request('merge'), signal())).status).toBe('blocked')
+    expect(await reopened.reconcile(prep.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect((await reopened.execute(h.request('merge'), signal())).status).toBe('accepted')
+    expect(h.transport.dispatch).toHaveBeenCalledTimes(2)
+    expect(h.transport.planMerge).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['target-race', 'source-plan', 'ci-plan', 'unvalidated-profile', 'owner-revoked', 'source-ci-failed'] as const)('blocks %s before metadata mutation', async fault => {
+    const h = ordinaryFixture(), c = h.create()
+    if (fault === 'source-ci-failed') h.snapshot.pipeline!.status = 'failed'
+    vi.mocked(h.transport.planMerge!).mockImplementationOnce(async () => {
+      if (fault === 'target-race') h.snapshot.targetSha = '4'.repeat(40)
+      if (fault === 'owner-revoked') h.revoke()
+      return { ...h.plan, ...(fault === 'source-plan' ? { sourceSha: BASE } : {}), ...(fault === 'ci-plan' ? { ciSha256: '0'.repeat(64) } : {}), ...(fault === 'unvalidated-profile' ? { validationProfile: 'package-only' as never } : {}) }
+    })
+    expect((await c.prepareMerge(h.request(), signal())).status).toBe('blocked')
+    expect(h.transport.dispatch).not.toHaveBeenCalled()
+  })
+
+  it.each(['digest', 'plan', 'op-id', 'expiry', 'unverified'] as const)('does not merge when immutable preparation %s changes', async fault => {
+    const h = ordinaryFixture(), c = h.create(); await ready(h, c)
+    if (fault === 'digest') h.snapshot.preparation!.metadataDigest = '4'.repeat(64)
+    if (fault === 'plan') h.snapshot.preparation!.plan.expectedTreeSha = '4'.repeat(40)
+    if (fault === 'op-id') h.snapshot.preparation!.operationId = 'another-prep'
+    if (fault === 'expiry') h.snapshot.preparation!.expiresAt = later(-1)
+    if (fault === 'unverified') h.snapshot.preparation!.verified = false
+    expect((await c.execute(h.request('merge'), signal())).status).toBe('blocked')
+    expect(h.transport.dispatch).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['parents', 'tree', 'target-raced', 'unverified'] as const)('marks actual M %s mismatch unknown without a second merge attempt', async fault => {
+    const h = ordinaryFixture(), c = h.create(); await ready(h, c)
+    const merged = await c.execute(h.request('merge'), signal()); h.merged()
+    if (fault === 'parents') h.snapshot.mergeRequest!.mergeParents = [SHA, h.target]
+    if (fault === 'tree') h.snapshot.mergeRequest!.mergeTreeSha = TREE
+    if (fault === 'target-raced') h.snapshot.mergeRequest!.mergeParents = ['4'.repeat(40), SHA]
+    if (fault === 'unverified') h.snapshot.mergeRequest!.mergeCommitVerified = false
+    expect(await c.reconcile(merged.operationId!, signal())).toMatchObject({ status: 'unknown', remoteActive: true })
+    expect((await c.execute(h.request('merge'), signal())).operationId).toBe(merged.operationId)
+    expect(h.transport.dispatch).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['missing', 'wrong-sha', 'wrong-tree', 'not-passed'] as const)('rejects deployment completion with %s actual-M full verification', async fault => {
+    const h = ordinaryFixture(true), c = h.create(); await ready(h, c)
+    const merged = await c.execute(h.request('merge'), signal()); expect(merged.status).toBe('accepted'); h.merged()
+    const deployment = h.snapshot.deployment!
+    deployment.state = 'succeeded'; deployment.healthy = true; deployment.builds![0] = { ...deployment.builds![0]!, state: 'succeeded', healthy: true, artifactDigest: `sha256:${JOB}` }
+    deployment.fullVerification = { sha: h.mergedSha, treeSha: h.mergedTree, profile: 'full-verify', passed: true }
+    if (fault === 'missing') delete deployment.fullVerification
+    if (fault === 'wrong-sha') deployment.fullVerification!.sha = SHA
+    if (fault === 'wrong-tree') deployment.fullVerification!.treeSha = TREE
+    if (fault === 'not-passed') deployment.fullVerification!.passed = false
+    expect(await c.reconcile(merged.operationId!, signal())).toMatchObject({ status: 'unknown', remoteActive: true })
+  })
+
+  it('adopts only existing M builds and completes after exact full-verify M/E proof', async () => {
+    const h = ordinaryFixture(true), c = h.create(), prepId = await ready(h, c)
+    const merge = await c.execute(h.request('merge'), signal()); h.merged()
+    expect(await c.reconcile(merge.operationId!, signal())).toMatchObject({ status: 'accepted', remoteActive: true })
+    const deploy = await c.execute(h.request('deploy'), signal())
+    expect(deploy.status).toBe('accepted')
+    expect(c.operations().at(-1)).toMatchObject({ sha: SHA, preparationId: prepId, mergePlan: h.plan })
+    const deployment = h.snapshot.deployment!
+    deployment.state = 'succeeded'; deployment.healthy = true; deployment.fullVerification = { sha: h.mergedSha, treeSha: h.mergedTree, profile: 'full-verify', passed: true }
+    deployment.builds![0] = { ...deployment.builds![0]!, state: 'succeeded', healthy: true, artifactDigest: `sha256:${JOB}` }
+    expect(await c.reconcile(deploy.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(await c.reconcile(merge.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(h.transport.dispatch).toHaveBeenCalledTimes(2)
+  })
+
+  it('seals completed historical source/merge evidence across later target advances without another observe', async () => {
+    const h = ordinaryFixture(), c = h.create()
+    delete h.snapshot.mergeRequest
+    const created = await c.execute(h.request('create_mr'), signal()); h.mr()
+    await c.reconcile(created.operationId!, signal())
+    const before = c.operations()[0]!
+    await ready(h, c); const merged = await c.execute(h.request('merge'), signal()); h.merged(); await c.reconcile(merged.operationId!, signal())
+    h.snapshot.targetSha = '9'.repeat(40); h.snapshot.mergeRequest!.mergeCommitSha = '8'.repeat(40)
+    const observed = vi.mocked(h.transport.observe).mock.calls.length
+    expect(await c.reconcile(created.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(await c.reconcile(merged.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(h.transport.observe).toHaveBeenCalledTimes(observed)
+    expect(c.remoteActive()).toBe(false)
+    expect(c.operations()[0]!.logicalKey).toBe(before.logicalKey)
+    expect(c.operations()[0]!.mergePlan).toBeUndefined()
+  })
+})
+
 describe('MR, merge and observation-only deployment gates', () => {
   it('progresses env=test push → MR → terminal CI → merge without treating a provisional deployment route as premerge activity', async () => {
     const h = fixture()
@@ -414,7 +592,7 @@ describe('MR, merge and observation-only deployment gates', () => {
     expect(c.remoteActive()).toBe(true)
   })
 
-  it('accounts for concrete deployment activity when rereading an earlier push after its journaled merge', async () => {
+  it('does not resurrect sealed push activity when a later merge owns active deployment effects', async () => {
     const h = fixture(); h.policy.repositories.repo!.mergeTriggersDeploy = true; h.policy.repositories.repo!.pushHasNoRemoteJobs = true
     const c = h.create(), pushed = await c.execute(h.request(), signal())
     h.snapshot.sourceSha = SHA
@@ -423,7 +601,10 @@ describe('MR, merge and observation-only deployment gates', () => {
     const merged = await c.execute(h.request('merge'), signal())
     expect(merged.status).toBe('accepted')
     h.merged(); h.snapshot.deployment!.ids = ['webhook-build-1']; h.snapshot.deployment!.state = 'running'; h.builds()
-    expect(await c.reconcile(pushed.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: true })
+    const observed = vi.mocked(h.transport.observe).mock.calls.length
+    expect(await c.reconcile(pushed.operationId!, signal())).toMatchObject({ status: 'succeeded', remoteActive: false })
+    expect(h.transport.observe).toHaveBeenCalledTimes(observed)
+    expect(c.remoteActive()).toBe(true) // The separate merge intent, not the historical push, owns uncertainty.
   })
 
   it('does not clear a premerge pipeline just because the deployment placeholder has no concrete IDs', async () => {
