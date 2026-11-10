@@ -27,6 +27,22 @@ export interface PiRunnerOptions {
   remoteActive?(taskId?: string): boolean
 }
 const TOOLS = 'read,grep,find,ls,bash,edit,write,night_action,night_release'
+/** Pi ships as a Node script whose shebang needs `node` on PATH. The worker PATH is
+ * deliberately minimal, so a JS entry point is launched with the current Node binary.
+ * Nothing here changes argv semantics: the script path simply becomes argv[1]. */
+export async function piCommand(executable: string): Promise<{ command: string; prefix: string[] }> {
+  try {
+    const handle = await open(executable, 'r')
+    try {
+      const buffer = Buffer.alloc(200)
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+      const first = buffer.subarray(0, bytesRead).toString('utf8').split('\n')[0] ?? ''
+      if (first.startsWith('#!') && /(?:^|\s)node(?:\s|$)/.test(first.slice(2))) return { command: process.execPath, prefix: [executable] }
+    } finally { await handle.close() }
+  } catch { /* binary/unreadable: execute it directly as before */ }
+  return { command: executable, prefix: [] }
+}
+
 const MAX_FRAME = 2 * 1024 * 1024
 const leasePath = (config: NightConfig) => resolve(config.stateDir, 'pi-runner.lock')
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
@@ -162,7 +178,8 @@ export class PiRunner implements Runner {
     }
     let child: ChildProcessWithoutNullStreams
     try {
-      child = (this.options.spawnProcess ?? spawn)(config.piExecutable, args, {
+      const launcher = await piCommand(config.piExecutable)
+      child = (this.options.spawnProcess ?? spawn)(launcher.command, [...launcher.prefix, ...args], {
         cwd: config.workspace, env, detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'],
       }) as ChildProcessWithoutNullStreams
     } catch {

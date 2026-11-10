@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createPiRunner } from '../src/nightshift/pi-runner.ts'
+import { createPiRunner, piCommand } from '../src/nightshift/pi-runner.ts'
 import type { NightConfig, Task } from '../src/nightshift/contracts.ts'
 
 const roots: string[] = []
@@ -29,7 +29,7 @@ function fixture(script: string) {
     target: { source: 'feishu', chatId: 'dm', messageId: 'm' }, state: 'running', createdAt: new Date().toISOString() }
   const runner = createPiRunner({ guardPath: '/Code/github/dsh-superagent-prototype/resources/nightshift-guard.mjs', startupTimeoutMs: 4000 })
   const run = () => runner.run({ runId: 'diag-run', task, deadline: new Date(Date.now() + 20_000).toISOString(), config }, new AbortController().signal)
-  return { root, config, run, diagnostic: () => existsSync(join(stateDir, 'pi-diagnostics.log')) ? readFileSync(join(stateDir, 'pi-diagnostics.log'), 'utf8') : '' }
+  return { root, config, executable, run, diagnostic: () => existsSync(join(stateDir, 'pi-diagnostics.log')) ? readFileSync(join(stateDir, 'pi-diagnostics.log'), 'utf8') : '' }
 }
 
 describe('Pi startup diagnostics', () => {
@@ -40,5 +40,12 @@ describe('Pi startup diagnostics', () => {
     const diagnostic = f.diagnostic()
     expect(diagnostic).toContain('Failed to load extension: bad policy')
     expect(diagnostic).not.toContain('sk-abcdefghijklmnop123456')
+  })
+
+  it('launches a Node-shebang Pi with the current Node binary instead of trusting PATH', async () => {
+    const f = fixture('#!/usr/bin/env node\nprocess.exit(0)\n')
+    expect(await piCommand(f.executable)).toEqual({ command: process.execPath, prefix: [f.executable] })
+    const shell = fixture('#!/bin/sh\nexit 1\n')
+    expect(await piCommand(shell.executable)).toEqual({ command: shell.executable, prefix: [] })
   })
 })
