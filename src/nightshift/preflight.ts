@@ -29,7 +29,7 @@ export async function safeGit(repo: string, args: string[], config: NightConfig)
   const keys = await exec(GIT, [...GIT_SAFE_ARGS, '-C', repo, 'config', '--no-includes', '--name-only', '--list'], {
     env: workerEnvironment(config), timeout: 5_000, maxBuffer: 128 * 1024, encoding: 'utf8',
   })
-  if (keys.stdout.split('\n').some(key => /^(?:include\.path|includeif\..+\.path|filter\..+\.(?:clean|smudge|process)|core\.worktree|extensions\.worktreeconfig|core\.sshcommand)$/i.test(key))) {
+  if (keys.stdout.split('\n').some(key => /^(?:include\.path|includeif\..+\.path|filter\..+\.(?:clean|smudge|process)|core\.worktree|core\.sshcommand)$/i.test(key))) {
     throw new Error('Executable Git filters/SSH or mutable includes/worktree configuration is unsupported')
   }
   const result = await exec(GIT, [...GIT_SAFE_ARGS, '-C', repo, ...args], {

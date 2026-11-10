@@ -184,7 +184,7 @@ export function createActions(inputPolicy, guard, options = {}) {
   }
   function inspectGit(root) {
     const keys = gitSync(root, ['config', '--no-includes', '--name-only', '--list']).split('\n')
-    if (keys.some(key => /^filter\..+\.(?:clean|smudge|process)$/i.test(key) || /^(?:include\.path|includeif\..+\.path|core\.sshcommand|core\.worktree|extensions\.worktreeconfig)$/i.test(key))) deny('Executable or redirected Git configuration is unsupported')
+    if (keys.some(key => /^filter\..+\.(?:clean|smudge|process)$/i.test(key) || /^(?:include\.path|includeif\..+\.path|core\.sshcommand|core\.worktree)$/i.test(key))) deny('Executable or redirected Git configuration is unsupported')
     if (gitSync(root, ['rev-parse', '--is-bare-repository']).trim() !== 'false' || realpathSync(gitSync(root, ['rev-parse', '--show-toplevel']).trim()) !== root) deny('Repository root mismatch')
     // Worktree/gitdir redirection would authorize metadata writes outside this repository.
     if (!lstatSync(resolve(root, '.git')).isDirectory() || realpathSync(resolve(root, '.git')) !== resolve(root, '.git')) deny('Linked worktrees/submodules are unsupported for broker actions')

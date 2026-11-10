@@ -96,7 +96,7 @@ export function createGuard(policy) {
   }
   async function git(root, args, signal) {
     const keys = await gitRaw(root, ['config', '--no-includes', '--name-only', '--list'], signal)
-    if (keys.split('\n').some(key => /^(?:include\.path|includeif\..+\.path|filter\..+\.(?:clean|smudge|process)|core\.worktree|extensions\.worktreeconfig|core\.sshcommand)$/i.test(key))) throw new Error('Executable Git filters/SSH or mutable includes/worktree configuration is unsupported')
+    if (keys.split('\n').some(key => /^(?:include\.path|includeif\..+\.path|filter\..+\.(?:clean|smudge|process)|core\.worktree|core\.sshcommand)$/i.test(key))) throw new Error('Executable Git filters/SSH or mutable includes/worktree configuration is unsupported')
     return gitRaw(root, args, signal)
   }
   async function writable(path, signal) {

@@ -188,7 +188,7 @@ def check():
     # Read no-includes config KEYS first; never traverse potentially executable
     # include/conditional include/filter definitions before rejecting their names.
     keys = nul_names(git(root, ['config', '--no-includes', '--name-only', '--null', '--list']))
-    require(not any(re.match(r'^(?:include(?:if\..+)?\.path|filter\..+\.(?:clean|smudge|process)|core\.(?:worktree|sshcommand)|extensions\.(?:worktreeconfig|objectformat))$', key, re.I) for key in keys), 'unsafe_git_configuration')
+    require(not any(re.match(r'^(?:include(?:if\..+)?\.path|filter\..+\.(?:clean|smudge|process)|core\.(?:worktree|sshcommand)|extensions\.objectformat)$', key, re.I) for key in keys), 'unsafe_git_configuration')
     for name in ('info/grafts', 'objects/info/alternates', 'objects/info/http-alternates', 'shallow'):
         require(not (git_dir / name).exists() and not (git_dir / name).is_symlink(), 'git_history_redirect_unsupported')
     for name in ('refs/replace', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer'):

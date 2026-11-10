@@ -411,6 +411,32 @@ describe('guarded disposable repository tools', () => {
     await expect(guard(f).execute('bash', { command: `git -C '${f.repo}' diff -- .` })).rejects.toThrow('regular file')
     await expect(guard(f).execute('bash', { command: `git -C '${f.repo}' diff -- .env` })).rejects.toThrow()
   })
+  it('accepts benign effective worktree configuration without weakening metadata write protection', async () => {
+    const f = fixture(); f.git(['config', 'extensions.worktreeConfig', 'true'])
+    writeFileSync(resolve(f.repo, '.git/config.worktree'), '[core]\n sparseCheckout = true\n sparseCheckoutCone = true\n[index]\n sparse = true\n')
+    writeFileSync(resolve(f.repo, '.git/info/sparse-checkout'), '/*\n!/*/\n')
+    const keys = f.git(['config', '--no-includes', '--name-only', '--list'])
+    for (const key of ['extensions.worktreeconfig', 'core.sparsecheckout', 'core.sparsecheckoutcone', 'index.sparse']) expect(keys).toContain(key)
+    expect((await preflight(f.config, [f.task], async () => [])).ok).toBe(true)
+    expect(await safeGit(f.repo, ['status', '--porcelain=v1'], f.config)).toBe('')
+    const g = guard(f, true)
+    expect((await g.execute('bash', { command: `git -C '${f.repo}' status --short` })).content[0]?.text).toBe('')
+    await expect(g.execute('write', { path: 'app/.git/config.worktree', content: 'unsafe' })).rejects.toThrow()
+  })
+  it.each(['filter', 'include', 'core.worktree'])('rejects malicious effective worktree %s before any filter execution', async kind => {
+    const f = fixture(); const marker = resolve(f.root, 'WORKTREE_FILTER_RAN')
+    f.git(['config', 'extensions.worktreeConfig', 'true'])
+    const filter = `[filter "evil"]\n clean = touch '${marker}'; cat\n`
+    const included = resolve(f.root, 'included-config'); writeFileSync(included, filter)
+    const configuration = kind === 'filter' ? filter : kind === 'include' ? `[include]\n path = ${included}\n` : `[core]\n worktree = ${f.repo}\n`
+    writeFileSync(resolve(f.repo, '.git/config.worktree'), configuration)
+    writeFileSync(resolve(f.repo, '.git/info/attributes'), '*.txt filter=evil\n')
+    writeFileSync(resolve(f.repo, 'hello.txt'), 'other\n'); utimesSync(resolve(f.repo, 'hello.txt'), new Date(1000), new Date(1000))
+    expect((await preflight(f.config, [f.task], async () => [])).ok).toBe(false)
+    await expect(safeGit(f.repo, ['status', '--porcelain=v1'], f.config)).rejects.toThrow('configuration')
+    await expect(guard(f).execute('bash', { command: `git -C '${f.repo}' status --short` })).rejects.toThrow('configuration')
+    expect(existsSync(marker)).toBe(false)
+  })
   it('rejects mutable Git include files before status can execute a host-side clean filter', async () => {
     const f = fixture(), marker = resolve(f.root, 'INCLUDE_FILTER_RAN')
     writeFileSync(resolve(f.repo, 'local-config'), `[filter "evil"]\n clean = touch '${marker}'; cat\n`)
