@@ -38,7 +38,7 @@ describe('nightshift real IM Outbox boundary', () => {
     const tasks = f.adapter.snapshot().tasks; expect(tasks).toHaveLength(1)
     expect(tasks[0]).toMatchObject({ text: original, repositories: ['mate-manage-web'], access: 'write', approved: false, state: 'queued', proposal: { requiresScopeConfirmation: true, issueRefs: ['mate-manage-web#84'] } })
     expect(tasks[0]!.actions).toBeUndefined(); expect(tasks[0]!.releaseGrant).toBeUndefined()
-    expect(f.receipt().text).toContain('确认任务'); expect(f.send).toHaveBeenCalledOnce(); expect(f.runner.run).not.toHaveBeenCalled(); f.check()
+    expect(f.receipt().text).toContain('确认这个范围吗'); expect(f.send).toHaveBeenCalledOnce(); expect(f.runner.run).not.toHaveBeenCalled(); f.check()
   })
   it('requires owner-confirmed exact scope followed by separate approval; neither can grant publish or start', async () => {
     const f = fixture(); await f.adapter.receive(f.event(original)); const id = f.adapter.snapshot().tasks[0]!.id

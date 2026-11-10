@@ -1,7 +1,7 @@
 /** Serialized, fail-closed supervisor. External awaits never hold the command queue. */
 import { randomUUID } from 'node:crypto'
-import type { Command, Incoming, NightConfig, NightController, PendingReply, RunResult, Runner, Task } from './contracts.ts'
-import { NightStore, type DurableState, type PendingCheck } from './store.ts'
+import type { ActionName, Command, Incoming, NightConfig, NightController, PendingReply, PendingActionInput, RunResult, Runner, Task } from './contracts.ts'
+import { NightStore, type DurableState, type PendingAction, type PendingCheck } from './store.ts'
 import { NIGHT_HELP, NIGHT_HELP_TOPICS } from './commands.ts'
 import { replyPage } from './replies.ts'
 import { policyDigest, ReleaseGrantSchema } from './release/coordinator.ts'
@@ -180,6 +180,33 @@ class Controller implements NightController {
           return
         }
         if (!this.config.enabled) { reply('夜间功能未启用，不接受任务授权或执行。'); return }
+        if (command.type === 'propose-action') {
+          this.proposeAction(state, command.action, input, reply)
+          return
+        }
+        if (command.type === 'confirm-action') {
+          const pending = state.pendingAction
+          if (!pending || pending.ownerId !== input.actorId || pending.chatId !== input.target.chatId) {
+            reply('没有等待确认的操作；这条消息没有执行。先说目标，我会复述边界再请你确认。'); return
+          }
+          delete state.pendingAction
+          if (!Number.isFinite(Date.parse(pending.expiresAt)) || Date.parse(pending.expiresAt) <= Date.now()) {
+            reply('这次确认已过期，未执行；请重新说一次目标。'); return
+          }
+          check = this.executePending(state, pending, input, reply)
+          return
+        }
+        if (command.type === 'decline-action') {
+          const pending = state.pendingAction
+          if (!pending || pending.ownerId !== input.actorId || pending.chatId !== input.target.chatId) { reply('没有等待确认的操作。'); return }
+          delete state.pendingAction
+          const drafted = pending.request.kind === 'task-scope' && pending.request.taskId
+            ? state.tasks.find(task => task.id === pending.request.taskId && task.ownerId === input.actorId && task.state === 'queued' && task.proposal?.requiresScopeConfirmation === true)
+            : undefined
+          if (drafted) { drafted.state = 'cancelled'; drafted.endedAt = iso(); reply('已取消，未执行；刚生成的草案也已取消。') }
+          else reply('已取消，未执行。')
+          return
+        }
         if (command.type === 'enqueue' || command.type === 'propose') {
           if (!command.text.trim() || command.text.length > 12000 || command.repositories.length === 0 || command.repositories.some(repository => !Object.hasOwn(this.config.repositories, repository)) || !['read', 'write'].includes(command.access)) {
             reply('拒绝：请提供任务内容、已配置的仓库别名和明确的 read/write 权限。'); return
@@ -225,20 +252,7 @@ class Controller implements NightController {
           task.releaseGrant = parsed.data
           reply(`发布预授权已记录 ${task.id}｜截止 ${parsed.data.expiresAt}｜${parsed.data.scopes.map(s => `${s.repository}:${s.sourceBranch}→${s.targetBranch}/${s.environment ?? '无部署'}/${s.actions.join(',')}`).join('；')}。执行仍需夜班启动与逐步证据门禁；deploy 只跟踪合并触发的部署，不重复触发 Jenkins。`)
         } else if (command.type === 'authorize-actions') {
-          const task = state.tasks.find(item => item.id === command.taskId)
-          if (!task || task.ownerId !== input.actorId || task.state !== 'queued' || !task.approved || state.mode === 'RECOVERY_REQUIRED') {
-            reply('拒绝：只有任务所有者可为已批准的排队任务授权额外动作。'); return
-          }
-          if (!command.actions.length || command.actions.some(a => !['validate', 'commit', 'publish'].includes(a))
-            || (task.access !== 'write' && command.actions.some(a => a !== 'validate'))) {
-            reply('拒绝：动作范围无效，提交/发布还要求任务 write 权限。'); return
-          }
-          const missing = task.repositories.filter(repo => !this.config.repositoryActions?.[repo])
-          if (missing.length) { reply(`拒绝：仓库尚无本地受审动作配置：${missing.join(',')}。`); return }
-          if (command.actions.includes('publish')) { reply('发布尚未启用：需先验证专用发布身份与远端边界；未授予 publish。'); return }
-          task.actions = [...new Set(command.actions)]
-          task.actionsApproveMessageId = input.id
-          reply(`已授权动作 ${task.id}：${task.actions.join(',')}。验证会执行本地配置中固定的受信任程序；不授予任意 shell、合并、部署或群消息权限。`)
+          this.grantActions(state, command.taskId, command.actions, input, reply)
         } else if (command.type === 'approve' || command.type === 'cancel') {
           const task = state.tasks.find(item => item.id === command.taskId)
           if (!task || task.ownerId !== input.actorId) { reply('拒绝：任务不存在，或发送者不是任务所有者。'); return }
@@ -278,6 +292,138 @@ class Controller implements NightController {
     }).catch(error => { this.failClosed(error); throw error })
   }
 
+  private createProposal(state: DurableState, text: string, repositories: string[], access: 'read' | 'write',
+    issueRefs: string[] | undefined, input: Incoming): Task {
+    const task: Task = { id: randomUUID(), originId: input.id, ownerId: input.actorId, text, repositories: [...new Set(repositories)],
+      access, approved: false, target: input.target, state: 'queued', createdAt: iso(),
+      proposal: { requiresScopeConfirmation: true, issueRefs: (issueRefs ?? []).slice(0, 20) } }
+    state.tasks.push(task)
+    return task
+  }
+  /** Stage exactly one action with its human-readable boundary; confirmation performs only this. */
+  private stage(state: DurableState, input: Incoming, request: PendingActionInput, summary: string): void {
+    state.pendingAction = { id: randomUUID(), ownerId: input.actorId, chatId: input.target.chatId,
+      createdAt: iso(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(), request, summary }
+  }
+  private pickTask(state: DurableState, input: Incoming, taskId: string | undefined): Task | undefined {
+    const mine = state.tasks.filter(task => task.ownerId === input.actorId && ['queued', 'running'].includes(task.state)
+      && task.proposal?.requiresScopeConfirmation !== true)
+    if (taskId) return mine.find(task => task.id === taskId)
+    const approved = mine.filter(task => task.approved)
+    return approved.length === 1 ? approved[0] : mine.length === 1 ? mine[0] : undefined
+  }
+  private proposeAction(state: DurableState, request: PendingActionInput, input: Incoming, reply: (text: string) => void): void {
+    if (!request || typeof request !== 'object') { reply('这条消息没有执行：目标不清楚。'); return }
+    const now = Date.now()
+    if (request.kind === 'task-proposal') {
+      const text = typeof request.text === 'string' ? request.text.trim() : ''
+      const requested = Array.isArray(request.repositories) ? [...new Set(request.repositories)] : []
+      const repositories = requested.filter(name => Object.hasOwn(this.config.repositories, name))
+      const access = request.access === 'read' ? 'read' : 'write'
+      if (!text || text.length > 12000 || !repositories.length || repositories.length !== requested.length) {
+        reply('这条消息没有执行：任务范围不明确或包含未配置的仓库。'); return
+      }
+      const existing = state.tasks.find(task => task.ownerId === input.actorId && task.state === 'queued'
+        && task.proposal?.requiresScopeConfirmation === true && task.repositories.join(',') === repositories.join(',')
+        && (request.issueRefs?.length ? task.proposal.issueRefs.some(ref => request.issueRefs!.includes(ref)) : task.text === text))
+      const task = existing ?? this.createProposal(state, text, repositories, access, request.issueRefs, input)
+      this.stage(state, input, { kind: 'task-scope', taskId: task.id }, repositories.join(','))
+      reply(`将登记一个待执行任务：\n范围 ${repositories.join(',')}（${access === 'read' ? '只读' : '修改'}）。\n不含提交、推送、合并、部署，也不会自动执行。\n确认这个范围吗？回复“确认”，或“算了”。`)
+      return
+    }
+    if (request.kind === 'start') {
+      if (this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING') { reply('现在有任务或准入检查在进行，完成或停止后再开始新的。'); return }
+      if (state.mode === 'RECOVERY_REQUIRED' || !state.writerStopped) { reply('当前是恢复态，需要先人工核查。说“可以恢复”，我再确认。'); return }
+      if (state.mode === 'NIGHT_RUNNING') { reply('夜班已在运行；要改截止时间请先说“先停一下”。'); return }
+      const deadlineMs = typeof request.deadline === 'string' ? instant(request.deadline) : NaN
+      if (!Number.isFinite(deadlineMs) || deadlineMs <= now || deadlineMs - now > MAX_SHIFT_MS || this.frozen(now)) {
+        reply('截止时间须在未来12小时内、带明确时区，且不跨越冻结窗口。'); return
+      }
+      const eligible = state.tasks.filter(task => task.ownerId === input.actorId && task.state === 'queued' && task.proposal?.requiresScopeConfirmation !== true)
+      if (!eligible.length) { reply('没有可执行的任务；先告诉我处理哪个仓库和问题。'); return }
+      const names = eligible.map(task => `${task.repositories.join(',')}（${task.access === 'read' ? '只读' : '修改'}）`).join('；')
+      this.stage(state, input, { kind: 'start', deadline: request.deadline, taskId: eligible[0]!.id }, names)
+      reply(`将批准并启动 ${eligible.length} 个任务：${names}。\n截止 ${request.deadline}。\n只执行已确认范围；提交、推送、合并、部署仍各自授权。\n确认开始吗？回复“确认”，或“算了”。`)
+      return
+    }
+    if (request.kind === 'allow-commit') {
+      const task = this.pickTask(state, input, request.taskId)
+      if (!task) { reply('没有唯一对应的任务；先告诉我处理哪个仓库和问题。'); return }
+      if (!task.approved) { reply('任务还没有批准；先说“开始”并给截止时间，批准后再授权提交。'); return }
+      this.stage(state, input, { kind: 'allow-commit', taskId: task.id }, task.repositories.join(','))
+      reply(`将允许任务范围 ${task.repositories.join(',')} 的本地验证和提交。\n不含推送、合并、部署，也不允许任意 shell。\n确认授权吗？回复“确认”，或“算了”。`)
+      return
+    }
+    if (request.kind === 'recover') {
+      if (state.mode !== 'RECOVERY_REQUIRED') { reply('当前不是恢复态，无需恢复。'); return }
+      this.stage(state, input, { kind: 'recover' }, '恢复')
+      reply('将把状态恢复为人工模式，unknown 任务保持原状、不重跑。\n确认已核查现场并恢复吗？回复“确认”，或“算了”。')
+      return
+    }
+    reply('这条消息没有执行：目标不清楚。')
+  }
+  private executePending(state: DurableState, pending: PendingAction, input: Incoming, reply: (text: string) => void): PendingCheck | undefined {
+    const request = pending.request
+    if (request.kind === 'task-scope') {
+      const task = state.tasks.find(item => item.id === request.taskId && item.ownerId === input.actorId)
+      if (!task || task.state !== 'queued' || task.proposal?.requiresScopeConfirmation !== true) { reply('任务状态已变化，未执行。'); return }
+      task.proposal.requiresScopeConfirmation = false
+      task.proposal.confirmedMessageId = input.id
+      task.approved = false; delete task.approveMessageId; delete task.actions; delete task.actionsApproveMessageId; delete task.releaseGrant
+      reply(`范围已确认：${task.repositories.join(',')}（${task.access === 'read' ? '只读' : '修改'}）。\n还没有开始。说“开始，截止今晚八点”这样的时间，我复述后再确认。`)
+      return
+    }
+    if (request.kind === 'start') {
+      const deadlineMs = typeof request.deadline === 'string' ? instant(request.deadline) : NaN
+      const now = Date.now()
+      if (!Number.isFinite(deadlineMs) || deadlineMs <= now || deadlineMs - now > MAX_SHIFT_MS || this.frozen(now)
+        || this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING') {
+        reply('当前不能开始：有任务或准入检查在进行，或截止时间已不适用。'); return
+      }
+      const eligible = state.tasks.filter(task => task.ownerId === input.actorId && task.state === 'queued' && task.proposal?.requiresScopeConfirmation !== true)
+      if (!eligible.length) { reply('没有可执行的任务，未开始。'); return }
+      const check: PendingCheck = { id: input.id, target: input.target, kind: 'start',
+        deadline: new Date(deadlineMs).toISOString(), taskIds: eligible.map(task => task.id) }
+      try { this.store.acquireWorkspace() } catch (error) { reply(`拒绝：工作区锁不可用。${errorText(error)}`); return }
+      state.pendingCheck = check
+      reply('预检中；通过后开始执行，未通过会说明原因。')
+      return check
+    }
+    if (request.kind === 'allow-commit') {
+      const task = this.pickTask(state, input, request.taskId)
+      if (!task) { reply('任务状态已变化，未执行。'); return }
+      this.grantActions(state, task.id, ['validate', 'commit'], input, reply)
+      return
+    }
+    if (request.kind === 'recover') {
+      if (state.mode !== 'RECOVERY_REQUIRED' || this.active || state.pendingCheck || this.dispatchCheck) {
+        reply('当前不能恢复：不是恢复态，或有任务/准入检查在进行。'); return
+      }
+      const check: PendingCheck = { id: input.id, target: input.target, kind: 'recover' }
+      try { this.store.acquireWorkspace() } catch (error) { reply(`拒绝：工作区锁不可用。${errorText(error)}`); return }
+      state.pendingCheck = check
+      reply('预检中；通过后恢复到人工模式，unknown 任务不会重跑。')
+      return check
+    }
+    reply('这条消息没有执行：目标不清楚。')
+  }
+  private grantActions(state: DurableState, taskId: string, actions: ActionName[], input: Incoming, reply: (text: string) => void): void {
+    const task = state.tasks.find(item => item.id === taskId)
+    if (!task || task.ownerId !== input.actorId || !['queued', 'running'].includes(task.state) || !task.approved || state.mode === 'RECOVERY_REQUIRED') {
+      reply('拒绝：只有任务所有者可为已批准的任务授权额外动作。'); return
+    }
+    if (!actions.length || actions.some(a => !['validate', 'commit', 'publish'].includes(a))
+      || (task.access !== 'write' && actions.some(a => a !== 'validate'))) {
+      reply('拒绝：动作范围无效，提交/发布还要求任务 write 权限。'); return
+    }
+    const missing = task.repositories.filter(repo => !this.config.repositoryActions?.[repo])
+    if (missing.length) { reply(`拒绝：仓库尚无本地受审动作配置：${missing.join(',')}。`); return }
+    if (actions.includes('publish')) { reply('发布尚未启用：需先验证专用发布身份与远端边界；未授予 publish。'); return }
+    task.actions = [...new Set(actions)]
+    task.actionsApproveMessageId = input.id
+    reply(`已授权动作 ${task.id}：${task.actions.join(',')}。验证会执行本地配置中固定的受信任程序；不授予任意 shell、合并、部署或群消息权限。${task.state === 'running' ? '\n任务已在运行，本次授权可能从本轮之后的步骤生效；需要立即生效请先停下再启动。' : ''}`)
+  }
+
   private invalidateCheck(state: DurableState): void {
     this.dispatchCheck = undefined
     if (state.pendingCheck) this.store.reply(`${state.pendingCheck.id}:final`, state.pendingCheck.target, '准入已被后续停止操作取消；如需运行，请重新 start/recover。')
@@ -310,6 +456,11 @@ class Controller implements NightController {
         this.store.reply(`${check.id}:final`, check.target, '人工核查确认及预检通过：DAY_MANUAL。unknown 任务保持原状、不重跑；执行新任务仍需 start。')
       } else {
         state.mode = 'NIGHT_RUNNING'; state.deadline = check.deadline
+        // Approval happened by explicit confirmation of the exact scope/task list, and only after preflight passed.
+        for (const id of check.taskIds ?? []) {
+          const approved = state.tasks.find(task => task.id === id && task.state === 'queued' && task.proposal?.requiresScopeConfirmation !== true)
+          if (approved) { approved.approved = true; approved.approveMessageId = check.id }
+        }
         this.store.reply(`${check.id}:final`, check.target, `NIGHT_RUNNING｜截止 ${check.deadline}；仅执行已明确批准的排队任务。`)
       }
     })

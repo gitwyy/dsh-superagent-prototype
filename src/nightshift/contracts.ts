@@ -99,6 +99,19 @@ export interface Incoming {
   target: ReplyTarget
 }
 export interface PendingReply { id: string; target: ReplyTarget; text: string }
+/** A natural-language request captured for one-step confirmation. It never executes by itself. */
+export interface PendingActionInput {
+  kind: 'task-proposal' | 'task-scope' | 'approve' | 'start' | 'allow-commit' | 'recover'
+  /** Task text for task-proposal; preserved verbatim as inert proposal text. */
+  text?: string
+  repositories?: string[]
+  access?: 'read' | 'write'
+  issueRefs?: string[]
+  taskId?: string
+  /** ISO deadline with explicit offset, for start. */
+  deadline?: string
+  actions?: ActionName[]
+}
 export type Command =
   | { type: 'pause' | 'handoff' }
   | { type: 'status'; page?: number }
@@ -108,6 +121,10 @@ export type Command =
   | { type: 'propose'; text: string; repositories: string[]; access: 'read' | 'write'; issueRefs?: string[] }
   | { type: 'confirm-task'; taskId: string; repositories: string[]; access: 'read' | 'write' }
   | { type: 'enqueue'; text: string; repositories: string[]; access: 'read' | 'write' }
+  /** Natural-language intent staged for explicit confirmation; confirmation alone performs exactly this action. */
+  | { type: 'propose-action'; action: PendingActionInput }
+  | { type: 'confirm-action' }
+  | { type: 'decline-action' }
   | { type: 'approve'; taskId: string }
   | { type: 'authorize-actions'; taskId: string; actions: ActionName[] }
   | { type: 'authorize-release'; taskId: string; expiresAt: string; scopes: ReleaseScope[] }

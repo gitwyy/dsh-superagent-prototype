@@ -4,10 +4,22 @@ import { chmodSync, closeSync, constants, fsyncSync, lstatSync, mkdirSync, openS
 import { hostname, homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import type { NightConfig, PendingReply, ReplyTarget, ShiftMode, Task } from './contracts.ts'
+import type { NightConfig, PendingActionInput, PendingReply, ReplyTarget, ShiftMode, Task } from './contracts.ts'
 
-export interface PendingCheck { id: string; kind: 'start' | 'recover'; target: ReplyTarget; deadline?: string }
+export interface PendingCheck { id: string; kind: 'start' | 'recover'; target: ReplyTarget; deadline?: string; taskIds?: string[] }
 export interface StopRequest { id: string; target: ReplyTarget; mode: 'DAY_MANUAL' | 'NIGHT_PAUSED' }
+/** One staged natural-language action awaiting the owner's confirmation in the same private chat. */
+export interface PendingAction {
+  id: string
+  ownerId: string
+  chatId: string
+  createdAt: string
+  /** Confirmation window; an expired request can never be confirmed later. */
+  expiresAt: string
+  request: PendingActionInput
+  /** Human-readable restatement of exact scope/limits shown before confirmation. */
+  summary: string
+}
 export interface DurableState {
   version: 1
   workspace: string
@@ -19,6 +31,7 @@ export interface DurableState {
   /** False also means unknown: absence of evidence is never evidence of a stopped writer. */
   writerStopped: boolean
   pendingCheck?: PendingCheck
+  pendingAction?: PendingAction
   stopRequests: StopRequest[]
   problems: string[]
   tasks: Task[]

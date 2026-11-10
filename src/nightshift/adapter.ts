@@ -3,15 +3,15 @@ import { key, type ReceiveResult, type Trigger } from '../core/index.ts'
 import { allowedSender, type Settings } from '../policy.ts'
 import type { Outbox } from '../app/outbox.ts'
 import type { HealthEntry } from '../infra/health.ts'
-import type { NightConfig, NightController, Runner, Incoming } from './contracts.ts'
+import type { Command, NightConfig, NightController, Runner, Incoming } from './contracts.ts'
 import { createController } from './controller.ts'
 import { parseNightCommand } from './commands.ts'
 import { parseNightProposal } from './proposals.ts'
+import { parseDialogue, type DialogueIntent } from './dialogue.ts'
 import { boundedNightReply, replyPage } from './replies.ts'
 import type { ManagedRunner } from './release/managed-runner.ts'
 
-export interface NightAdapterHost {
-  settings(): Settings
+export interface NightAdapterHost {  settings(): Settings
   outbox: Pick<Outbox, 'send'>
   health: HealthEntry
   config: NightConfig
@@ -89,16 +89,24 @@ export class NightAdapter {
     let command
     try { command = parseNightCommand(trigger.text) }
     catch {
-      const proposal = parseNightProposal(trigger.text, Object.keys(this.host.config.repositories))
+      const snapshot = this.controller.snapshot()
+      const intent = parseDialogue(trigger.text, {
+        mode: snapshot.mode, repositories: Object.keys(this.host.config.repositories), activeRunId: snapshot.activeRunId,
+        now: new Date().toISOString(),
+        tasks: snapshot.tasks.map(task => ({ id: task.id, state: task.state, approved: task.approved, repositories: task.repositories,
+          access: task.access, text: task.text, scopePending: task.proposal?.requiresScopeConfirmation === true })),
+      })
+      if (intent) command = dialogueCommand(intent, snapshot.tasks)
+      const proposal = command ? undefined : parseNightProposal(trigger.text, Object.keys(this.host.config.repositories))
       if (proposal) command = { type: 'propose' as const, ...proposal }
-      else {
+      if (!command) {
         this.host.outbox.send({ id: key('night-invalid', trigger.id), channel: trigger.channel, kind: 'reply',
-          text: '这条消息没有执行：指令格式或任务范围不明确。可说“处理 mate-manage-web#84”生成待确认任务，或用“入队 只读 仓名 | 任务说明”。查看：帮助／帮助 任务／帮助 发布。' })
+          text: '这条消息没有执行：没听清要做什么。可以直接说目标，例如“处理 mate-manage-web#84”“开始，截止今晚八点”“先停一下”“进度怎么样”。' })
         return 'stored'
       }
     }
     // Controls that stop work must remain usable when the ordinary application is paused.
-    if (denied && !['status', 'help', 'task-detail', 'reply-detail', 'pause', 'handoff', 'cancel'].includes(command.type)) {
+    if (denied && !['status', 'help', 'task-detail', 'reply-detail', 'pause', 'handoff', 'cancel', 'decline-action'].includes(command.type)) {
       this.host.outbox.send({ id: key('night-paused', trigger.id), channel: trigger.channel, kind: 'reply',
         text: '服务管理开关已暂停；未启动或批准任务。可发送“状态”或“我要接班”。' })
       return 'stored'
@@ -147,5 +155,37 @@ export class NightAdapter {
     this.closed = true
     // close() persists any final stop receipts; the next startup transfers them into the application outbox.
     await this.controller.close()
+  }
+}
+
+const pad = (value: number) => String(value).padStart(2, '0')
+/** Local +08:00 restatement of an instant; the controller revalidates the exact instant before acting. */
+function localIso(milliseconds: number): string {
+  const date = new Date(milliseconds + 8 * 3600_000)
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}+08:00`
+}
+const DEFAULT_WINDOW_MS = 2 * 3600_000
+/** Natural language becomes a staged action; nothing here executes or grants directly. */
+function dialogueCommand(intent: DialogueIntent, tasks: ReturnType<NightController['snapshot']>['tasks']): Command | undefined {
+  const defaultDeadline = () => localIso(Date.now() + DEFAULT_WINDOW_MS)
+  switch (intent.kind) {
+    case 'confirm': return { type: 'confirm-action' }
+    case 'decline': return { type: 'decline-action' }
+    case 'pause': return { type: 'pause' }
+    case 'handoff': return { type: 'handoff' }
+    case 'status': return { type: 'status' }
+    case 'recover': return { type: 'propose-action', action: { kind: 'recover' } }
+    case 'go': return { type: 'propose-action', action: { kind: 'start', deadline: intent.deadline ?? defaultDeadline() } }
+    case 'allow-commit': return { type: 'propose-action', action: { kind: 'allow-commit', ...(intent.taskId ? { taskId: intent.taskId } : {}) } }
+    case 'task': {
+      const matched = intent.taskId ? tasks.find(task => task.id === intent.taskId) : undefined
+      // Continuing a task whose scope is already confirmed means proceed; it still requires one confirmation.
+      if (matched && matched.proposal?.requiresScopeConfirmation !== true) {
+        return { type: 'propose-action', action: { kind: 'start', deadline: defaultDeadline() } }
+      }
+      return { type: 'propose-action', action: { kind: 'task-proposal', text: intent.text, repositories: intent.repositories,
+        access: intent.access, ...(intent.issueRefs?.length ? { issueRefs: intent.issueRefs } : {}) } }
+    }
+    default: return undefined
   }
 }

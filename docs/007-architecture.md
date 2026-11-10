@@ -292,6 +292,7 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | --- | --- |
 | `src/nightshift/replies.ts` | Bounded private IM fallback and explicit Unicode-safe detail pages |
 | `src/nightshift/proposals.ts` | Conservative natural-language task suggestions without execution authority |
+| `src/nightshift/dialogue.ts` | Deterministic natural-language intents and local deadlines; staging only, never execution |
 | `src/nightshift/release/deployment-tickets.ts` | Host-signed immutable per-job deployment grants, exact metadata verification and read-only evidence |
 | `src/nightshift/release/composite-transport.ts` | GitLab, signed tickets and Jenkins observer composition with fresh private attestations |
 | `src/nightshift/release/contracts.ts` | Host-only release grants, immutable scope and remote evidence contracts |
@@ -444,6 +445,9 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/nightshift-publisher-merge.spec.ts` | Bot-only full verification, actual merge proof and versioned publisher asset integration |
 | `tests/nightshift-replies.spec.ts` | IM word limits, non-authoritative fallback, Unicode-safe explicit paging |
 | `tests/nightshift-proposals.spec.ts` | Natural-language proposal scope parsing and control/foreign-scope rejection |
+| `tests/nightshift-dialogue.spec.ts` | Deterministic natural-language intents, local deadlines and adversarial prose rejection |
+| `tests/nightshift-dialogue-flow.spec.ts` | Staged action → one confirmation → only that action; expiry, other-owner and preflight failures |
+| `tests/nightshift-dialogue-adapter.spec.ts` | Real adapter/Outbox natural-language restate-confirm-act without direct grants |
 | `tests/nightshift-im-replay.spec.ts` | Real Outbox failure/reopen and Feishu backfill replay without duplicate proposals or authority |
 | `tests/nightshift-im-boundary.spec.ts` | Real durable Outbox constraints, task proposal confirmation and private receipt retrieval |
 | `tests/nightshift-source-check.spec.ts` | Fixed non-executing local source gate, exact changed/staged files, and explicit no-tests/no-compile evidence |
