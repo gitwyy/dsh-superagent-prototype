@@ -11,10 +11,12 @@ import type { RepositoryActions } from '../src/nightshift/contracts.ts'
 
 const actionsPath = fileURLToPath(new URL('../resources/nightshift-actions.mjs', import.meta.url))
 const guardPath = fileURLToPath(new URL('../resources/nightshift-guard.mjs', import.meta.url))
-const { createActions } = await import(actionsPath)
+const { createActions, runProcess } = await import(actionsPath)
 const { createGuard } = await import(guardPath)
 const roots: string[] = []
+const processGroups: number[] = []
 afterEach(() => {
+  for (const pgid of processGroups.splice(0)) { try { process.kill(-pgid, 'SIGKILL') } catch { /* disposable group already gone */ } }
   for (const root of roots.splice(0)) {
     if (dirname(root) !== realpathSync(tmpdir()) || !root.split('/').at(-1)?.startsWith('nightshift-actions-test-')) throw new Error('Unsafe fixture cleanup')
     rmSync(root, { recursive: true, force: true })
@@ -40,10 +42,49 @@ function fixture(script = 'process.exit(0)') {
   return { root, workspace, repo, home, stateDir, git, head, config, policy, guard }
 }
 function fakeClose(code = 0) {
-  const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true })
-  queueMicrotask(() => { child.stdout.end(); child.stderr.end(); child.emit('close', code) })
-  return child
+  // The commit effect is simulated, but process lifetime is real and independently
+  // grouped; pid-less event emitters cannot prove that a writer has stopped.
+  return spawn(process.execPath, ['-e', `process.exit(${code})`], { detached: true, env: { PATH: '/usr/bin:/bin' }, stdio: ['ignore', 'pipe', 'pipe'] })
 }
+
+describe('host-owned action process groups', { timeout: 10_000 }, () => {
+  const processOptions = (signal?: AbortSignal, timeoutMs = 3000) => ({ cwd: realpathSync(tmpdir()), env: { PATH: '/usr/bin:/bin' }, signal, timeoutMs, capture: true })
+  it('does not complete at parent exit while a same-group grandchild remains', async () => {
+    let pgid = 0
+    const script = `const c=require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'ignore',detached:false});c.unref();process.stdout.write(String(c.pid));`
+    const result = await runProcess(process.execPath, ['-e', script], processOptions(), (executable: string, args: string[], options: SpawnOptions) => {
+      expect(options.detached).toBe(true); const child = spawn(executable, args, options); pgid = child.pid!; processGroups.push(pgid); return child
+    })
+    expect(result.writerStopped).toBe(true)
+    expect(result.spawnError).toBe(true) // lingering-child cleanup must never produce a passing validation
+    expect(() => process.kill(-pgid, 0)).toThrow()
+    expect(() => process.kill(Number(result.stdout), 0)).toThrow()
+  })
+  it('kills the owned group on abort and preserves host liveness', async () => {
+    const abort = new AbortController(); let pgid = 0
+    const promise = runProcess(process.execPath, ['-e', 'process.stdout.write("ready");setInterval(()=>{},30000)'], processOptions(abort.signal), (executable: string, args: string[], options: SpawnOptions) => {
+      const child = spawn(executable, args, options); pgid = child.pid!; processGroups.push(pgid)
+      child.stdout!.once('data', () => abort.abort()); return child
+    })
+    const result = await promise
+    expect(result).toMatchObject({ aborted: true, writerStopped: true })
+    expect(() => process.kill(-pgid, 0)).toThrow(); expect(() => process.kill(process.pid, 0)).not.toThrow()
+  })
+  it('rejects unproven group exit after a hard cap, swallowing signal errors only', async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 1234567, stdout: new PassThrough(), stderr: new PassThrough() })
+    const promise = runProcess('/fixture', [], processOptions(undefined, 20), () => { queueMicrotask(() => child.emit('close', 0)); return child }, { groupExists: () => true, signalGroup: () => { throw new Error('simulated EPERM') }, graceMs: 5, finalWaitMs: 20 })
+    await expect(promise).rejects.toMatchObject({ code: 'NIGHTSHIFT_WRITER_UNKNOWN', writerStopped: false, pgid: 1234567 })
+  })
+  it('rejects a pid-less fake close rather than claiming writerStopped', async () => {
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() })
+    await expect(runProcess('/fixture', [], processOptions(undefined, 20), () => { queueMicrotask(() => child.emit('close', 0)); return child }, { graceMs: 5, finalWaitMs: 20 })).rejects.toMatchObject({ code: 'NIGHTSHIFT_WRITER_UNKNOWN', writerStopped: false })
+  })
+  it('accepts an explicit fake process-group proof seam and reports actual spawn errors safely', async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 1234567, stdout: new PassThrough(), stderr: new PassThrough() })
+    expect(await runProcess('/fixture', [], processOptions(), () => { queueMicrotask(() => child.emit('close', 0)); return child }, { groupExists: () => false })).toMatchObject({ code: 0, writerStopped: true })
+    expect(await runProcess('/definitely/not/a/real/executable', [], processOptions())).toMatchObject({ spawnError: true, writerStopped: true })
+  })
+})
 
 describe('explicit scoped action broker', { timeout: 30_000 }, () => {
   it('defaults to no actions and never accepts model executable/argv/env', async () => {
@@ -68,7 +109,7 @@ describe('explicit scoped action broker', { timeout: 30_000 }, () => {
     writeFileSync(resolve(f.repo, 'source.txt'), 'approved change\n')
     const out = await broker.execute({ action: 'validate', repository: 'app', recipe: 'check' })
     expect(out).toMatchObject({ outcome: 'succeeded', passed: true, exitCode: 0 })
-    expect(calls).toHaveLength(1); expect(calls[0]?.options).toMatchObject({ cwd: f.repo, shell: false, detached: false })
+    expect(calls).toHaveLength(1); expect(calls[0]?.options).toMatchObject({ cwd: f.repo, shell: false, detached: true })
     const env = JSON.parse(readFileSync(resolve(f.repo, 'dist/env.json'), 'utf8'))
     expect(env.HOME).toBe(resolve(f.stateDir, 'action-home'))
     expect(env.GIT_AUTHOR_NAME).toBeUndefined(); expect(env.GL_TOKEN).toBeUndefined()
@@ -99,6 +140,14 @@ describe('explicit scoped action broker', { timeout: 30_000 }, () => {
     const broker = createActions(f.policy, f.guard)
     expect((await broker.execute({ action: 'validate', repository: 'app', recipe: 'check' })).outcome).toBe('failed')
     expect((await broker.execute({ action: 'commit', repository: 'app', message: 'fix' })).outcome).toBe('blocked')
+  })
+  it('propagates unverified writer shutdown instead of downgrading it to blocked validation', async () => {
+    const f = fixture()
+    const broker = createActions(f.policy, f.guard, { spawnProcess() {
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() })
+      queueMicrotask(() => child.emit('close', 0)); return child
+    } })
+    await expect(broker.execute({ action: 'validate', repository: 'app', recipe: 'check' })).rejects.toMatchObject({ code: 'NIGHTSHIFT_WRITER_UNKNOWN', writerStopped: false })
   })
   it('bounds validation timeout and waits for close', async () => {
     const f = fixture('setInterval(()=>{},10000)'); f.config.validations.check!.timeoutSeconds = 0.1

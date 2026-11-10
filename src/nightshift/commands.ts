@@ -1,5 +1,7 @@
 /** A bounded private-message control vocabulary. Natural language cannot silently grant execution permission. */
 import type { Command } from './contracts.ts'
+import { ReleaseScopeSchema } from './release/coordinator.ts'
+import { z } from 'zod'
 
 export const NIGHT_HELP = [
   'Mate v2 单会话夜班（仅私聊）。默认白天人工；消息入队不等于开始执行。',
@@ -28,6 +30,13 @@ export function parseNightCommand(text: string): Command {
     const names = value.split(/\s+/u).at(-1)!.split(/[,，]/u)
     const map = { 验证: 'validate', 提交: 'commit', 发布: 'publish' } as const
     return { type: 'authorize-actions', taskId: actions[1]!, actions: [...new Set(names.map(n => map[n as keyof typeof map]))] }
+  }
+  const release = /^预授权发布\s+([A-Za-z0-9_-]{1,100})\s+截止\s+(\S+)\s*\|\s*([\s\S]+)$/u.exec(value)
+  if (release) {
+    const expiresAt = z.string().datetime({ offset: true }).parse(release[2])
+    if (release[3]!.length > 16000) throw new Error('发布范围过长。')
+    const scopes = z.array(ReleaseScopeSchema).min(1).max(17).parse(JSON.parse(release[3]!))
+    return { type: 'authorize-release', taskId: release[1]!, expiresAt, scopes }
   }
   const start = /^开始夜班\s+截止\s+(\S+)$/u.exec(value)
   if (start) {

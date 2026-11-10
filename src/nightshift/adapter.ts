@@ -6,13 +6,14 @@ import type { HealthEntry } from '../infra/health.ts'
 import type { NightConfig, NightController, Runner, Incoming } from './contracts.ts'
 import { createController } from './controller.ts'
 import { NIGHT_HELP, parseNightCommand } from './commands.ts'
+import type { ManagedRunner } from './release/managed-runner.ts'
 
 export interface NightAdapterHost {
   settings(): Settings
   outbox: Pick<Outbox, 'send'>
   health: HealthEntry
   config: NightConfig
-  runner: Runner
+  runner: Runner & Partial<Pick<ManagedRunner, 'operations' | 'reconcile'>>
 }
 /** Authenticates direct messages and transfers durable supervisor receipts into the existing Outbox. */
 export class NightAdapter {
@@ -65,6 +66,21 @@ export class NightAdapter {
     if (!chatId || !messageId) return 'filtered'
     const incoming: Incoming = { id: trigger.id, actorId: trigger.actor.id, text: trigger.text, at: trigger.at,
       direct: true, human: true, target: { source: 'feishu', chatId, messageId } }
+    if (trigger.text.trim() === '发布状态' && this.host.runner.operations) {
+      const operations = this.host.runner.operations().filter(op => this.controller.snapshot().tasks.some(t => t.id === op.taskId && t.ownerId === incoming.actorId))
+      this.host.outbox.send({ id: key('release-status', trigger.id), channel: trigger.channel, kind: 'reply',
+        text: operations.length ? operations.slice(-10).map(op => `${op.id} ${op.repository}/${op.action} ${op.state} ${op.sha.slice(0, 12)}\n${op.detail}`).join('\n') : '没有本人的远端发布记录；未执行远端动作。' })
+      return 'stored'
+    }
+    const reconcile = /^核查发布\s+([a-zA-Z0-9-]{1,100})$/u.exec(trigger.text.trim())
+    if (reconcile && this.host.runner.operations && this.host.runner.reconcile) {
+      const operation = this.host.runner.operations().find(op => op.id === reconcile[1])
+      if (!operation || !this.controller.snapshot().tasks.some(t => t.id === operation.taskId && t.ownerId === incoming.actorId)) return 'filtered'
+      const result = await this.host.runner.reconcile(operation.id, AbortSignal.timeout(30000))
+      this.host.outbox.send({ id: key('release-reconcile', trigger.id), channel: trigger.channel, kind: 'reply',
+        text: `${result.operationId ?? operation.id} ${result.status}\n${result.detail}\n远端活动或结果不明：${result.remoteActive ? '是' : '否'}。本操作只读核查，没有重新触发。` })
+      return 'stored'
+    }
     let command
     try { command = parseNightCommand(trigger.text) }
     catch (error) {
@@ -85,6 +101,8 @@ export class NightAdapter {
   snapshot() {
     return { enabled: this.host.config.enabled, workspace: this.host.config.workspace,
       sessionFile: this.host.config.sessionFile, repositories: Object.keys(this.host.config.repositories),
+      ...(this.host.config.releasePolicy ? { releaseEnabled: this.host.config.releasePolicy.enabled,
+        releaseOperations: this.host.runner.operations?.() ?? [] } : {}),
       ...this.controller.snapshot() }
   }
   private flush(): void {

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { Command, Incoming, NightConfig, NightController, PendingReply, RunResult, Runner, Task } from './contracts.ts'
 import { NightStore, type DurableState, type PendingCheck } from './store.ts'
 import { NIGHT_HELP } from './commands.ts'
+import { policyDigest, ReleaseGrantSchema } from './release/coordinator.ts'
 
 const MAX_SHIFT_MS = 12 * 60 * 60 * 1000
 const STOP_GRACE_MS = 10_000
@@ -21,7 +22,7 @@ function instant(value: string): number {
 }
 function checkedResult(value: RunResult): RunResult {
   if (!value || !['succeeded', 'failed', 'cancelled', 'blocked', 'unknown'].includes(value.outcome)
-    || typeof value.writerStopped !== 'boolean' || typeof value.summary !== 'string'
+    || typeof value.writerStopped !== 'boolean' || (value.remoteActive !== undefined && typeof value.remoteActive !== 'boolean') || typeof value.summary !== 'string'
     || !Array.isArray(value.evidence) || value.evidence.some(item => typeof item !== 'string')) {
     return { outcome: 'unknown', summary: '执行器返回的停止证据无效。', writerStopped: false, evidence: [] }
   }
@@ -169,6 +170,29 @@ class Controller implements NightController {
           const task: Task = { id: randomUUID(), originId: input.id, ownerId: input.actorId, text: command.text, repositories: [...new Set(command.repositories)], access: command.access, approved: false, target: input.target, state: 'queued', createdAt: iso() }
           state.tasks.push(task)
           reply(`已排队 ${task.id}｜${task.repositories.join(',')}｜${task.access}。需任务所有者明确批准；添加任务不会启动夜间执行。`)
+        } else if (command.type === 'authorize-release') {
+          const task = state.tasks.find(item => item.id === command.taskId), policy = this.config.releasePolicy
+          if (!task || task.ownerId !== input.actorId || task.state !== 'queued' || !task.approved || task.access !== 'write'
+            || state.mode === 'RECOVERY_REQUIRED' || !policy?.enabled) {
+            reply('拒绝：发布策略未启用，或不是本人已批准的排队写任务。'); return
+          }
+          const expires = instant(command.expiresAt), time = Date.now()
+          if (!Number.isFinite(expires) || expires <= time || expires - time > policy.maxGrantSeconds * 1000 || this.frozen(time)
+            || this.windows.some(w => w.from < expires && w.until > time)) {
+            reply('拒绝：发布有效期须在允许时限内且不能跨越冻结窗口。'); return
+          }
+          const parsed = ReleaseGrantSchema.safeParse({ id: randomUUID(), taskId: task.id, ownerId: task.ownerId,
+            approvalMessageId: input.id, issuedAt: iso(), expiresAt: command.expiresAt,
+            policyDigest: policyDigest(policy), scopes: command.scopes })
+          if (!parsed.success || parsed.data.scopes.some(scope => {
+            const repo = policy.repositories[scope.repository]
+            return !task.repositories.includes(scope.repository) || !repo || repo.targetBranch !== scope.targetBranch
+              || (scope.environment && !repo.environments[scope.environment])
+              || (repo.mergeTriggersDeploy && scope.actions.includes('merge') && (!scope.actions.includes('deploy') || !scope.environment))
+              || (scope.actions.includes('deploy') && (!scope.actions.includes('merge') || !scope.environment))
+          })) { reply('拒绝：发布范围、目标分支或测试部署联动授权不完整。'); return }
+          task.releaseGrant = parsed.data
+          reply(`发布预授权已记录 ${task.id}｜截止 ${parsed.data.expiresAt}｜${parsed.data.scopes.map(s => `${s.repository}:${s.sourceBranch}→${s.targetBranch}/${s.environment ?? '无部署'}/${s.actions.join(',')}`).join('；')}。执行仍需夜班启动与逐步证据门禁；deploy 只跟踪合并触发的部署，不重复触发 Jenkins。`)
         } else if (command.type === 'authorize-actions') {
           const task = state.tasks.find(item => item.id === command.taskId)
           if (!task || task.ownerId !== input.actorId || task.state !== 'queued' || !task.approved || state.mode === 'RECOVERY_REQUIRED') {
@@ -358,7 +382,7 @@ class Controller implements NightController {
       const task = state.tasks.find(item => item.id === active.taskId)!
       task.result = result; task.state = result.writerStopped ? result.outcome : 'unknown'; task.endedAt = iso()
       state.writerStopped = result.writerStopped
-      const ambiguous = !result.writerStopped || result.outcome === 'unknown' || this.recoveryLatched || state.mode === 'RECOVERY_REQUIRED'
+      const ambiguous = result.remoteActive === true || !result.writerStopped || result.outcome === 'unknown' || this.recoveryLatched || state.mode === 'RECOVERY_REQUIRED'
       if (ambiguous) {
         state.mode = 'RECOVERY_REQUIRED'; state.problems = [`${task.id}：${result.summary}。需人工核查恢复；不会自动重跑。`]
       } else {
@@ -368,7 +392,7 @@ class Controller implements NightController {
           delete state.deadline
         }
       }
-      this.store.reply(`run:${active.runId}:finished`, task.target, `${task.id}：${task.state}。${result.summary}\n写入进程退出：${result.writerStopped ? '已确认' : '未确认'}。`)
+      this.store.reply(`run:${active.runId}:finished`, task.target, `${task.id}：${task.state}。${result.summary}\n写入进程退出：${result.writerStopped ? '已确认' : '未确认'}。${result.remoteActive ? '\n远端发布/部署仍活动或结果未知；本地退出不代表远端停止，未确认安全交接。' : ''}`)
       this.completeStops(state, !ambiguous)
     })
     clearTimeout(active.stopTimer); clearTimeout(active.taskTimer)

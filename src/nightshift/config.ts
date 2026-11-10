@@ -3,6 +3,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import type { NightConfig } from './contracts.ts'
+import { ReleasePolicySchema } from './release/coordinator.ts'
 
 const absolute = z.string().min(1).refine(isAbsolute, 'absolute path required')
 const iso = z.string().datetime({ offset: true })
@@ -27,6 +28,7 @@ export const NightConfigSchema = z.object({
   harnessRoot: absolute.optional(),
   lockRoot: absolute.optional(),
   repositories: z.record(alias, absolute),
+  releasePolicy: ReleasePolicySchema.optional(),
   repositoryActions: z.record(alias, z.object({
     validations: z.record(alias, recipe),
     requiredValidations: z.array(alias).min(1),
@@ -78,6 +80,13 @@ export function loadNightConfig(file: string): NightConfig {
   }
   if (!Object.keys(repositories).length) throw new Error('Nightshift requires an explicit repository allowlist')
   if (Object.keys(c.repositoryActions ?? {}).some(name => !Object.hasOwn(repositories, name))) throw new Error('Action configuration names an unregistered repository')
+  if (c.releasePolicy) for (const [name, policy] of Object.entries(c.releasePolicy.repositories)) {
+    if (policy.alias !== name || !Object.hasOwn(repositories, name) || realpathSync(policy.root) !== repositories[name]) {
+      throw new Error('Release route must match an explicitly allowed canonical repository')
+    }
+    if (inside(workspace, canonicalTarget(policy.credentialFile))) throw new Error('Release credential must remain outside the Pi workspace')
+    if (JSON.stringify(c.releasePolicy.freezeWindows) !== JSON.stringify(c.freezeWindows)) throw new Error('Release and shift freeze windows must be identical')
+  }
   const executable = realpathSync(c.piExecutable)
   if (!statSync(executable).isFile()) throw new Error('piExecutable is not a file')
   return { ...c, workspace, stateDir: canonicalTarget(stateDir), sessionFile: canonicalTarget(sessionFile),

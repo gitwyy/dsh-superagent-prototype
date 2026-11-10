@@ -9,7 +9,7 @@ const exec = promisify(execFile)
 const isMissingPath = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 export const FIXED_PATH = `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`
 export const GIT = '/usr/bin/git'
-export const GIT_SAFE_ARGS = ['--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'credential.helper=']
+export const GIT_SAFE_ARGS = ['--no-replace-objects', '--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'credential.helper=']
 export function within(root: string, path: string): boolean {
   const rel = relative(root, path)
   return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
@@ -24,6 +24,14 @@ export function workerEnvironment(config: NightConfig): NodeJS.ProcessEnv {
   }
 }
 export async function safeGit(repo: string, args: string[], config: NightConfig): Promise<string> {
+  // Config names are non-executable. Reject mutable includes before Git reads the working tree;
+  // otherwise an allowed source edit could install a clean filter that status executes in the host.
+  const keys = await exec(GIT, [...GIT_SAFE_ARGS, '-C', repo, 'config', '--no-includes', '--name-only', '--list'], {
+    env: workerEnvironment(config), timeout: 5_000, maxBuffer: 128 * 1024, encoding: 'utf8',
+  })
+  if (keys.stdout.split('\n').some(key => /^(?:include\.path|includeif\..+\.path|filter\..+\.(?:clean|smudge|process)|core\.worktree|extensions\.worktreeconfig|core\.sshcommand)$/i.test(key))) {
+    throw new Error('Executable Git filters/SSH or mutable includes/worktree configuration is unsupported')
+  }
   const result = await exec(GIT, [...GIT_SAFE_ARGS, '-C', repo, ...args], {
     env: workerEnvironment(config), timeout: 5_000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8',
   })

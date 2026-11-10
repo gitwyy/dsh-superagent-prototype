@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createPiRunner, RpcFramer } from '../src/nightshift/pi-runner.ts'
-import { preflight, workerEnvironment } from '../src/nightshift/preflight.ts'
+import { preflight, workerEnvironment, safeGit } from '../src/nightshift/preflight.ts'
 import type { NightConfig, RunRequest, Task } from '../src/nightshift/contracts.ts'
 
 const guardPath = fileURLToPath(new URL('../resources/nightshift-guard.mjs', import.meta.url))
@@ -318,6 +318,16 @@ describe('guarded disposable repository tools', () => {
     const f = fixture(); writeFileSync(resolve(f.repo, '.env'), 'SECRET=test-fixture-only\n')
     await expect(guard(f).execute('bash', { command: `git -C '${f.repo}' diff -- .` })).rejects.toThrow('regular file')
     await expect(guard(f).execute('bash', { command: `git -C '${f.repo}' diff -- .env` })).rejects.toThrow()
+  })
+  it('rejects mutable Git include files before status can execute a host-side clean filter', async () => {
+    const f = fixture(), marker = resolve(f.root, 'INCLUDE_FILTER_RAN')
+    writeFileSync(resolve(f.repo, 'local-config'), `[filter "evil"]\n clean = touch '${marker}'; cat\n`)
+    f.git(['config', 'include.path', '../local-config'])
+    writeFileSync(resolve(f.repo, '.git/info/attributes'), '*.txt filter=evil\n')
+    writeFileSync(resolve(f.repo, 'hello.txt'), 'other\n'); utimesSync(resolve(f.repo, 'hello.txt'), new Date(1000), new Date(1000))
+    await expect(safeGit(f.repo, ['status', '--porcelain'], f.config)).rejects.toThrow('includes')
+    await expect(guard(f).execute('bash', { command: `git -C '${f.repo}' status --short` })).rejects.toThrow('includes')
+    expect(existsSync(marker)).toBe(false)
   })
   it('rejects git clean/smudge process configuration before invoking a filter', async () => {
     const f = fixture(); f.git(['config', 'filter.evil.clean', `touch ${f.root}/FILTER_RAN`])

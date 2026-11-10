@@ -290,6 +290,15 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 
 | Path | Responsibility |
 | --- | --- |
+| `src/nightshift/release/contracts.ts` | Host-only release grants, immutable scope and remote evidence contracts |
+| `src/nightshift/release/coordinator.ts` | Durable release admission, live revocation, exact-SHA gates and read-only reconciliation |
+| `src/nightshift/release/journal.ts` | Persistent single-owner intent journal and restart ambiguity handling |
+| `src/nightshift/release/gitlab.ts` | Typed fixed-origin GitLab identity, MR/CI/merge observation and guarded dispatch |
+| `src/nightshift/release/git-transport.ts` | Isolated Git object export and exact-SHA nonforce push with private credentials |
+| `src/nightshift/release/action-bridge.ts` | Run-scoped private Unix socket for host validation/commit and release capabilities |
+| `src/nightshift/release/receipts.ts` | Durable host commit receipts and exact task-owned commit-chain candidate evidence |
+| `src/nightshift/release/managed-runner.ts` | Composition of controller authority, Pi runner, host receipts and release coordinator |
+| `src/nightshift/release/jenkins-observer.ts` | Read-only exact-SHA webhook-build observation with pinned route, queue identity and deployment artifacts |
 | `src/nightshift/contracts.ts` | Fixed-workspace supervisor, task, reply and runner contracts; explicit read/write scope |
 | `src/nightshift/config.ts` | Local trusted nightshift config loading, canonical paths and repository boundaries |
 | `src/nightshift/commands.ts` | Bounded Chinese private-message control parser; no implicit task grants |
@@ -420,6 +429,14 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/drive-exclusion.spec.ts` | Cross-entry exclusion of enrolled nightshift workspaces, symlink aliases and malformed registry failure |
 | `tests/nightshift-controller.spec.ts` | Durable task authorization, serial dispatch, cancellation races, locks and restart ambiguity |
 | `tests/nightshift-runner.spec.ts` | Fake Pi RPC lifecycle and scoped guard execution in disposable repositories |
+| `tests/nightshift-release.spec.ts` | Durable remote intent, exact grants/identity/CI and automatic-deploy reconciliation |
+| `tests/nightshift-gitlab-release.spec.ts` | Bounded credential-safe GitLab transport and isolated exact-SHA Git push |
+| `tests/nightshift-jenkins-gate.spec.ts` | Offline signed single-use remote write admission, deadline/freeze and path protection |
+| `tests/nightshift-jenkins-observer.spec.ts` | GET-only Jenkins observation, exact queue/build/SHA routes, duplicate and artifact-provenance rejection |
+| `tests/nightshift-managed-runner.spec.ts` | Real controller and host action bridge admission, persisted receipt trust and remote activity recovery |
+| `tests/nightshift-action-bridge.spec.ts` | Private capability RPC, trusted commit callbacks and host process shutdown uncertainty |
+| `tests/nightshift-release-grants.spec.ts` | Human task-preauthorization parsing, scope/deadline/production/config revocation gates |
+| `tests/nightshift-commit-receipts.spec.ts` | Exact host-receipted Git ancestry, parent/tree/branch/CI and dirty-state verification |
 | `tests/nightshift-actions.spec.ts` | Separately approved validation recipes, source-bound receipts, scoped local commit and fail-closed publication |
 | `tests/nightshift-adapter.spec.ts` | DM-only authentication, parser/config boundaries, pause and message idempotency |
 | `tests/nightshift-e2e.spec.ts` | Isolated normalized-message to real controller/SQLite to supervised fake-Pi integration, serial runs, persistent replies and handoff exit proof |

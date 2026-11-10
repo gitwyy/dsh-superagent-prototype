@@ -7,12 +7,12 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { constants, closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
-import { createActions } from './nightshift-actions.mjs'
+import { callNightHost } from './nightshift-client.mjs'
 
-const TOOLS = ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'night_action']
+const TOOLS = ['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write', 'night_action', 'night_release']
 const MAX_FILE = 1024 * 1024
 const MAX_OUTPUT = 32 * 1024
-const SAFE_GIT = ['--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'credential.helper=']
+const SAFE_GIT = ['--no-replace-objects', '--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'credential.helper=']
 const inside = (root, path) => { const r = relative(root, path); return r === '' || (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) }
 const deniedPart = part => ['.git', '.pi', '.ssh', '.aws', '.config', '.superagent-nightshift.lock', 'node_modules'].includes(part.toLowerCase()) || /^\.env(?:\.|$)/i.test(part) || /(?:^|[._-])(credentials?|secrets?|tokens?)(?:[._-]|$)/i.test(part) || /\.(?:pem|key|p12|pfx)$/i.test(part)
 const textResult = text => ({ content: [{ type: 'text', text: String(text).slice(0, MAX_OUTPUT) }], details: {} })
@@ -73,6 +73,7 @@ export function createGuard(policy) {
       } catch (error) { if (error.code !== 'ENOENT') throw error; if (!write) throw new Error('Path does not exist') }
     }
     if (write && !(policy.access === 'write' && policy.approved === true)) throw new Error('Scoped write approval required')
+    if (write && /(^|\/)(?:\.gitlab(?:\/|-ci)|\.github\/|Jenkinsfile|Dockerfile|\.mvn\/|\.npmrc|\.yarnrc|\.gitmodules|\.gitattributes|deploy(?:\/|\.)|release(?:\/|\.))/i.test(relative(root, path))) throw new Error('Release control-plane changes require a separate operator-reviewed task')
     return { path, root }
   }
   async function gitRaw(root, args, signal) {
@@ -94,8 +95,8 @@ export function createGuard(policy) {
     })
   }
   async function git(root, args, signal) {
-    const keys = await gitRaw(root, ['config', '--name-only', '--list'], signal)
-    if (keys.split('\n').some(key => /^filter\..+\.(?:clean|smudge|process)$/i.test(key) || key.toLowerCase() === 'core.sshcommand')) throw new Error('Executable Git filters/SSH configuration is unsupported')
+    const keys = await gitRaw(root, ['config', '--no-includes', '--name-only', '--list'], signal)
+    if (keys.split('\n').some(key => /^(?:include\.path|includeif\..+\.path|filter\..+\.(?:clean|smudge|process)|core\.worktree|extensions\.worktreeconfig|core\.sshcommand)$/i.test(key))) throw new Error('Executable Git filters/SSH or mutable includes/worktree configuration is unsupported')
     return gitRaw(root, args, signal)
   }
   async function writable(path, signal) {
@@ -230,7 +231,7 @@ export function createGuard(policy) {
 export default function nightshiftGuard(pi) {
   const policy = JSON.parse(process.env.NIGHTSHIFT_POLICY ?? 'null')
   const guard = createGuard(policy)
-  const actions = policy.actions?.length ? createActions(policy, guard) : undefined
+  const host = policy.hostActions
   let ready = false
   let queue = Promise.resolve()
   const blocked = ctx => { ready = false; ctx.ui.setStatus('nightshift-guard', `${policy.runId}:blocked`) }
@@ -251,7 +252,8 @@ export default function nightshiftGuard(pi) {
     }
   })
   const definitions = [
-    ['night_action', 'Run a separately approved fixed validation recipe or scoped local commit. No arbitrary commands. Publication is disabled; validation failures are evidence, not success.', schema({ action: { type: 'string', enum: ['validate', 'commit', 'publish'] }, repository: string('Task-approved repository alias'), recipe: string('Operator-configured validation name'), message: string('Commit message; only for commit'), title: string('MR title; publication currently disabled'), description: string('MR description; publication currently disabled') }, ['action', 'repository'])],
+    ['night_release', 'Request a host-brokered task-preauthorized push, MR creation, merge, or observation of its existing auto-deployment. Acceptance is not completion; deployment does not trigger another Jenkins build.', schema({ action: { type: 'string', enum: ['push', 'create_mr', 'merge', 'deploy'] }, repository: string('Exact task-granted repository alias'), sha: string('Exact 40-character commit SHA with host commit receipts'), title: string('Required for MR creation'), description: string('Optional MR description; system marker is added by host') }, ['action', 'repository', 'sha'])],
+    ['night_action', 'Run a separately approved host-side fixed validation recipe or scoped local commit. No arbitrary commands; validation failures are evidence, not success.', schema({ action: { type: 'string', enum: ['validate', 'commit', 'publish'] }, repository: string('Task-approved repository alias'), recipe: string('Operator-configured validation name'), message: string('Commit message; only for commit'), title: string('MR title; publication currently disabled'), description: string('MR description; publication currently disabled') }, ['action', 'repository'])],
     ['read', 'Read repository text with line numbers; credential and metadata paths are excluded.', schema({ path: string('Absolute or workspace-relative file'), offset: number, limit: number }, ['path'])],
     ['ls', 'List approved repository directory entries, excluding protected paths.', schema({ path: string('Absolute or workspace-relative directory') }, ['path'])],
     ['find', 'Find repository paths by literal substring (not glob); bounded to 500 files and 100 matches.', schema({ path: string('Approved directory'), pattern: string('Literal path substring') }, ['path', 'pattern'])],
@@ -266,12 +268,13 @@ export default function nightshiftGuard(pi) {
         const operation = queue.then(async () => {
           try {
             if (!ready || signal?.aborted) throw new Error('Guard not ready or operation cancelled')
-            if (name === 'night_action') {
-              if (!actions) throw new Error('No separately approved actions are available')
-              const result = await actions.execute(input, signal)
-              if (result.outcome === 'unknown') { ready = false; ctx.ui.setStatus('nightshift-guard', `${policy.runId}:unknown`) }
-              else if (result.outcome === 'blocked') blocked(ctx)
-              return { ...textResult(JSON.stringify(result)), isError: result.outcome === 'blocked' || result.outcome === 'unknown' }
+            if (name === 'night_action' || name === 'night_release') {
+              if (!host) throw new Error('No host action capability available')
+              const result = await callNightHost(host, name === 'night_action' ? 'action' : 'release', input, signal)
+              const state = result.outcome ?? result.status
+              if (state === 'unknown') { ready = false; ctx.ui.setStatus('nightshift-guard', `${policy.runId}:unknown`) }
+              else if (state === 'blocked') blocked(ctx)
+              return { ...textResult(JSON.stringify(result)), isError: state === 'blocked' || state === 'unknown' }
             }
             return await guard.execute(name, input, signal)
           } catch (error) {

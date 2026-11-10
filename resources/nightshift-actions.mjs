@@ -12,7 +12,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 const GIT = '/usr/bin/git'
 const MAX_CAPTURE = 8 * 1024 * 1024
 const MAX_SOURCE = 64 * 1024 * 1024
-const SAFE_GIT = ['--literal-pathspecs', '--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'commit.gpgsign=false', '-c', 'tag.gpgSign=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'maintenance.autoDetach=false', '-c', 'credential.helper=', '-c', 'protocol.allow=never', '-c', 'protocol.file.allow=never']
+const SAFE_GIT = ['--no-replace-objects', '--literal-pathspecs', '--no-pager', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.pager=cat', '-c', 'diff.external=', '-c', 'diff.submodule=short', '-c', 'log.showSignature=false', '-c', 'status.submoduleSummary=false', '-c', 'submodule.recurse=false', '-c', 'commit.gpgsign=false', '-c', 'tag.gpgSign=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'maintenance.autoDetach=false', '-c', 'credential.helper=', '-c', 'protocol.allow=never', '-c', 'protocol.file.allow=never']
 const inside = (root, path) => { const r = relative(root, path); return r === '' || (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) }
 const hash = value => createHash('sha256').update(value).digest('hex')
 const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,159}$/.test(value)
@@ -45,31 +45,102 @@ function cleanEnvironment(home) {
   return { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, LANG: 'C', LC_ALL: 'C', CI: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_ALLOW_PROTOCOL: '' }
 }
 
-/** A fixed-argv runner. Waits for close (not exit); never emits raw child output.
- * Children stay in the Pi group; the supervising runner owns group shutdown.
- * A trusted recipe that detaches cannot be contained by this mechanism.
+/** Host-owned fixed-argv runner: every process receives its OWN POSIX group.
+ * Parent close is not sufficient: descendants must be verified gone too. Never
+ * signal the shared host/Pi process group. Escaped setsid/daemon processes remain
+ * outside this cooperative boundary; trusted recipes must not detach themselves.
+ * Unknown shutdown rejects with NIGHTSHIFT_WRITER_UNKNOWN / writerStopped=false;
+ * the broker/bridge must propagate this and retain writer ownership, not hand off.
+ * The fifth parameter is an explicit unit-test seam, never model/policy input.
  */
-function runProcess(executable, args, options, spawnProcess) {
-  return new Promise(resolveResult => {
-    if (options.signal?.aborted) { resolveResult({ code: null, aborted: true, stdout: '', outputBytes: 0 }); return }
+export function runProcess(executable, args, options, spawnProcess = spawn, supervision = {}) {
+  return new Promise((resolveResult, rejectResult) => {
+    const noChild = extra => resolveResult({ code: null, stdout: '', outputBytes: 0, writerStopped: true, ...extra })
+    if (options.signal?.aborted) { noChild({ aborted: true }); return }
+    if (process.platform === 'win32' || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) { noChild({ spawnError: true }); return }
     let child
-    try { child = spawnProcess(executable, args, { cwd: options.cwd, env: options.env, shell: false, detached: false, stdio: ['ignore', 'pipe', 'pipe'] }) }
-    catch { resolveResult({ code: null, spawnError: true, stdout: '', outputBytes: 0 }); return }
+    try { child = spawnProcess(executable, args, { cwd: options.cwd, env: options.env, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }) }
+    catch { noChild({ spawnError: true }); return }
+    const pgid = Number.isSafeInteger(child.pid) && child.pid > 1 && child.pid !== process.pid ? child.pid : undefined
+    const groupExists = supervision.groupExists ?? (pid => {
+      try { process.kill(-pid, 0); return true }
+      catch (error) { if (error.code === 'ESRCH') return false; throw error }
+    })
+    const signalGroup = supervision.signalGroup ?? ((pid, signal) => {
+      try { process.kill(-pid, signal) }
+      catch (error) { if (error.code !== 'ESRCH') throw error }
+    })
+    const graceMs = supervision.graceMs ?? 150
+    const finalWaitMs = supervision.finalWaitMs ?? 1500
     let stdout = ''; let outputBytes = 0; let timedOut = false; let overflow = false; let spawnError = false; let aborted = false
-    const kill = () => { try { child.kill('SIGKILL') } catch { /* close/group supervisor remains authoritative */ } }
-    const timer = setTimeout(() => { timedOut = true; kill() }, options.timeoutMs)
-    const abort = () => { aborted = true; kill() }
+    let code = null; let closed = false; let settled = false; let stopping = false; let cleanupRequired = false
+    const timers = new Set()
+    const later = (callback, ms) => {
+      const timer = setTimeout(() => { timers.delete(timer); if (!settled) callback() }, ms)
+      timers.add(timer); return timer
+    }
+    const cleanup = () => {
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear(); options.signal?.removeEventListener('abort', abort)
+    }
+    const unknown = () => {
+      if (settled) return
+      settled = true; cleanup()
+      // Drain without retaining logs. Do not destroy a stream and call that proof
+      // of child/group termination; leave the uncertain writer for host recovery.
+      child.stdout?.resume(); child.stderr?.resume()
+      const error = new Error('Host action process-group shutdown could not be verified; retain writer ownership')
+      error.code = 'NIGHTSHIFT_WRITER_UNKNOWN'; error.writerStopped = false; error.pgid = pgid
+      rejectResult(error)
+    }
+    const verify = () => {
+      if (settled || !closed) return settled
+      let gone = false
+      if (pgid === undefined) gone = spawnError // only a Node spawn error proves no child existed
+      else {
+        try { gone = groupExists(pgid) === false } catch { /* EPERM/unknown is never gone */ }
+      }
+      if (!gone) return false
+      settled = true; cleanup()
+      resolveResult({ code, stdout, outputBytes, timedOut, overflow, spawnError: spawnError || cleanupRequired, aborted, writerStopped: true })
+      return true
+    }
+    const sendSignal = signal => {
+      if (pgid === undefined) return
+      // Signal errors never escape an abort/event/timer handler. Only a subsequent
+      // process-group probe can prove stopped, including ESRCH races.
+      try { signalGroup(pgid, signal) } catch { /* verify or hard cap decides */ }
+    }
+    const probe = () => { if (!verify()) later(probe, 25) }
+    const stop = () => {
+      if (settled || stopping) return
+      stopping = true
+      if (verify()) return
+      sendSignal('SIGTERM')
+      later(() => { if (!verify()) sendSignal('SIGKILL') }, graceMs)
+      later(() => { if (!verify()) unknown() }, graceMs + finalWaitMs)
+      later(probe, 25)
+    }
+    const abort = () => { aborted = true; stop() }
+    later(() => { timedOut = true; stop() }, options.timeoutMs)
     options.signal?.addEventListener('abort', abort, { once: true })
-    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
+    for (const stream of [child.stdout, child.stderr]) stream?.on('data', chunk => {
+      if (settled) return
       outputBytes += chunk.length
       if (options.capture && stream === child.stdout && outputBytes <= MAX_CAPTURE) stdout += chunk.toString('utf8')
-      if (outputBytes > MAX_CAPTURE) { overflow = true; kill() }
+      if (outputBytes > MAX_CAPTURE) { overflow = true; stop() }
     })
-    child.once('error', () => { spawnError = true })
-    child.once('close', code => {
-      clearTimeout(timer); options.signal?.removeEventListener('abort', abort)
-      resolveResult({ code, stdout, outputBytes, timedOut, overflow, spawnError, aborted })
+    child.once('error', () => { spawnError = true; stop() })
+    child.once('close', exitCode => {
+      code = exitCode; closed = true
+      if (verify()) return
+      // A zero-exit parent with live descendants is NOT a passing validation.
+      cleanupRequired = true; stop()
     })
+    if (options.signal?.aborted) abort()
+    // A fake child without a PID is not silently safe; use explicit supervision
+    // seams or an actual harmless process when a test simulates successful work.
+    if (pgid === undefined && !spawnError) later(() => { if (!verify()) stop() }, 1)
   })
 }
 
@@ -112,8 +183,8 @@ export function createActions(inputPolicy, guard, options = {}) {
     catch { deny('Read-only Git verification failed') }
   }
   function inspectGit(root) {
-    const keys = gitSync(root, ['config', '--name-only', '--list']).split('\n')
-    if (keys.some(key => /^filter\..+\.(?:clean|smudge|process)$/i.test(key) || /^(?:core\.sshcommand|core\.worktree|extensions\.worktreeconfig)$/i.test(key))) deny('Executable or redirected Git configuration is unsupported')
+    const keys = gitSync(root, ['config', '--no-includes', '--name-only', '--list']).split('\n')
+    if (keys.some(key => /^filter\..+\.(?:clean|smudge|process)$/i.test(key) || /^(?:include\.path|includeif\..+\.path|core\.sshcommand|core\.worktree|extensions\.worktreeconfig)$/i.test(key))) deny('Executable or redirected Git configuration is unsupported')
     if (gitSync(root, ['rev-parse', '--is-bare-repository']).trim() !== 'false' || realpathSync(gitSync(root, ['rev-parse', '--show-toplevel']).trim()) !== root) deny('Repository root mismatch')
     // Worktree/gitdir redirection would authorize metadata writes outside this repository.
     if (!lstatSync(resolve(root, '.git')).isDirectory() || realpathSync(resolve(root, '.git')) !== resolve(root, '.git')) deny('Linked worktrees/submodules are unsupported for broker actions')
@@ -179,6 +250,7 @@ export function createActions(inputPolicy, guard, options = {}) {
     } catch (error) { baselines.set(alias, { error: error instanceof Denied ? error.message : 'Baseline verification failed' }) }
   }
   function authorized(input) {
+    options.assertAuthorized?.()
     if (!input || typeof input !== 'object' || !['validate', 'commit', 'publish'].includes(input.action) || typeof input.repository !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(input.repository)) deny('Invalid action request')
     if (Object.keys(input).some(key => !['action', 'repository', 'recipe', 'message', 'title', 'description'].includes(key))) deny('Executable, arguments and environment cannot be supplied by the model')
     if (policy.approved !== true || !Array.isArray(policy.actions) || !policy.actions.includes(input.action) || !safeId(policy.actionApprovalId)) deny('Explicit scoped action approval is required')
@@ -217,6 +289,8 @@ export function createActions(inputPolicy, guard, options = {}) {
     }
   }
   async function gitMutate(root, args, signal, env = environment()) {
+    options.assertAuthorized?.()
+    if (signal?.aborted) deny('Action revoked before mutation')
     return runProcess(GIT, [...SAFE_GIT, '-C', root, ...args], { cwd: root, env, signal, timeoutMs: 30_000, capture: false }, spawnProcess)
   }
   async function perform(input, signal) {
@@ -230,6 +304,7 @@ export function createActions(inputPolicy, guard, options = {}) {
         receipts.delete(`${repository}:${input.recipe}`)
         const { recipe, env, pins } = recipeConfig(root, config, input.recipe)
         audit({ action, repository, outcome: 'started', recipe: input.recipe, head: current.head, digest: source.digest, pins })
+        options.assertAuthorized?.()
         const run = await runProcess(realpathSync(recipe.executable), recipe.args, { cwd: root, env, signal, timeoutMs: recipe.timeoutSeconds * 1000, capture: false }, spawnProcess)
         const after = inspectGit(root)
         const afterSource = sourceSnapshot(root)
@@ -237,7 +312,7 @@ export function createActions(inputPolicy, guard, options = {}) {
         const outcome = passed ? 'succeeded' : 'failed'
         const failure = run.spawnError ? 'recipe could not start' : run.aborted ? 'cancelled' : run.timedOut ? 'timeout' : run.overflow ? 'output limit exceeded' : run.code !== 0 ? `exit code ${run.code}` : 'source, index, branch or HEAD changed'
         audit({ action, repository, outcome, recipe: input.recipe, head: current.head, digest: source.digest, pins, exitCode: run.code, timedOut: !!run.timedOut, aborted: !!run.aborted, outputBytes: run.outputBytes })
-        if (passed) receipts.set(`${repository}:${input.recipe}`, { head: current.head, branch: current.branch, digest: source.digest, pins })
+        if (passed) receipts.set(`${repository}:${input.recipe}`, { id: hash(JSON.stringify([policy.taskId, policy.runId, repository, input.recipe, current.head, source.digest, pins])), head: current.head, branch: current.branch, digest: source.digest, pins })
         return { outcome, action, repository, passed, exitCode: run.code, summary: passed ? 'Pinned validation passed against unchanged source and HEAD.' : `Validation failed (${failure}); no passing receipt exists. Recipe output withheld because it may contain credentials.`, evidence: [...evidence] }
       }
       if (typeof input.message !== 'string' || !input.message.trim() || input.message.length > 4000 || input.message.includes('\0')) deny('Commit requires a bounded nonempty message')
@@ -257,8 +332,12 @@ export function createActions(inputPolicy, guard, options = {}) {
       const after = inspectGit(root)
       if (after.head === current.head || after.branch !== current.branch || gitSync(root, ['rev-parse', 'HEAD^']).trim() !== current.head || sourceSnapshot(root).digest !== source.digest || gitSync(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'])) deny('Post-commit evidence is inconsistent; manual review required')
       audit({ action, repository, outcome: 'succeeded', head: after.head, parent: current.head, digest: source.digest, files: changed.length })
+      if (options.onCommit) await options.onCommit({ repository, head: after.head, parent: current.head, branch: after.branch,
+        sourceDigest: source.digest, validationIds: config.requiredValidations.map(name => receipts.get(`${repository}:${name}`).id),
+        recipePins: Object.fromEntries(config.requiredValidations.map(name => [name, receipts.get(`${repository}:${name}`).pins])) })
       return { outcome: 'succeeded', action, repository, head: after.head, summary: 'Committed only approved changed source files with pinned author and current required validations. No push or merge request was performed.', evidence: [...evidence] }
     } catch (error) {
+      if (error?.code === 'NIGHTSHIFT_WRITER_UNKNOWN') throw error
       const summary = error instanceof Denied ? error.message : 'Action verification failed; no raw subprocess output is disclosed'
       if (mutationStarted) uncertain.add(repository)
       const outcome = mutationStarted ? 'unknown' : 'blocked'

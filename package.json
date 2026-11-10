@@ -28,6 +28,7 @@
     "prompts",
     "resources/nightshift-guard.mjs",
     "resources/nightshift-actions.mjs",
+    "resources/nightshift-client.mjs",
     "skills"
   ],
   "dsh": {

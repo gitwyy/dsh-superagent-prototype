@@ -49,7 +49,7 @@ import { mainTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 import { loadNightConfig } from '../nightshift/config.ts'
 import { NightAdapter } from '../nightshift/adapter.ts'
-import { createPiRunner } from '../nightshift/pi-runner.ts'
+import { createManagedRunner, type ManagedRunner } from '../nightshift/release/managed-runner.ts'
 import { packagePath } from '../infra/paths.ts'
 
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
@@ -90,6 +90,7 @@ export class Runtime extends Service implements SourceHost {
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
   private night?: NightAdapter
+  private nightRunner?: ManagedRunner
   /** Capture before Setup applies process-wide bot/git shims; pi runner independently filters its environment. */
   private readonly originalEnvironment = { ...process.env }
   constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
@@ -233,7 +234,12 @@ export class Runtime extends Service implements SourceHost {
         throw new Error('Nightshift mode requires every non-Feishu source disabled (deployment credentials can remain configured)')
       }
       const config = loadNightConfig(this.machine.nightshiftConfig)
-      this.night = new NightAdapter({ config, runner: createPiRunner({ baseEnvironment: this.originalEnvironment, guardPath: packagePath('resources', 'nightshift-guard.mjs') }),
+      const runner = this.nightRunner = createManagedRunner(config, {
+        snapshot: () => this.night?.controller.snapshot(),
+        isAuthorized: owner => !this.store.settings().paused && this.store.settings().sources.feishu?.enabled === true
+          && !!allowedSender(this.store.settings(), { source: 'feishu', id: owner }),
+      }, { baseEnvironment: this.originalEnvironment, guardPath: packagePath('resources', 'nightshift-guard.mjs') })
+      this.night = new NightAdapter({ config, runner,
         settings: () => this.store.settings(), outbox: this.outbox, health: this.board.claim('nightshift') })
       // Only durable reply effects run. No LLM assessor, DSH worker or old ticket continuation is installed.
       this.effects.start()
@@ -268,6 +274,7 @@ export class Runtime extends Service implements SourceHost {
     let nightFailure: unknown
     try {
       try { await this.night?.close() } catch (error) { nightFailure = error }
+      try { await this.nightRunner?.close() } catch (error) { nightFailure ??= error }
       // Even if nightshift reports a shutdown/persistence failure, drain host effects and transports.
       // The night controller retains its reservations on uncertainty; host cleanup does not claim safe handoff.
       this.assessor.stop()

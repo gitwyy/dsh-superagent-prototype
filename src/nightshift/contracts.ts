@@ -1,4 +1,5 @@
 /** Night-shift boundaries. No dependency on DSH/Feishu: the adapter owns transport and authentication. */
+import type { ReleaseGrant, ReleasePolicy, ReleaseScope } from './release/contracts.ts'
 export type ShiftMode = 'DAY_MANUAL' | 'NIGHT_RUNNING' | 'HANDOFF_PENDING' | 'NIGHT_PAUSED' | 'RECOVERY_REQUIRED'
 export type TaskState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'blocked' | 'unknown'
 export type ActionName = 'validate' | 'commit' | 'publish'
@@ -37,6 +38,8 @@ export interface NightConfig {
   lockRoot?: string
   repositories: Record<string, string>
   repositoryActions?: Record<string, RepositoryActions>
+  /** Host-only release policy. Credentials and route details must never be serialized into Pi environment. */
+  releasePolicy?: ReleasePolicy
   provider?: string
   model?: string
   thinking?: string
@@ -58,6 +61,7 @@ export interface Task {
   /** Separately approved host-broker actions. Legacy tasks default to no actions. */
   actions?: ActionName[]
   actionsApproveMessageId?: string
+  releaseGrant?: ReleaseGrant
   target: ReplyTarget
   state: TaskState
   createdAt: string
@@ -71,6 +75,8 @@ export interface RunResult {
   summary: string
   /** True only once the supervised child and its process group have been verified gone. */
   writerStopped: boolean
+  /** Remote build/deployment may outlive the local Pi group; never infer safe handoff from local exit alone. */
+  remoteActive?: boolean
   evidence: string[]
 }
 export interface RunRequest { runId: string; task: Task; deadline: string; config: NightConfig }
@@ -95,6 +101,7 @@ export type Command =
   | { type: 'enqueue'; text: string; repositories: string[]; access: 'read' | 'write' }
   | { type: 'approve'; taskId: string }
   | { type: 'authorize-actions'; taskId: string; actions: ActionName[] }
+  | { type: 'authorize-release'; taskId: string; expiresAt: string; scopes: ReleaseScope[] }
   | { type: 'cancel'; taskId: string }
   | { type: 'start'; deadline: string }
   | { type: 'recover'; acknowledged: boolean }
