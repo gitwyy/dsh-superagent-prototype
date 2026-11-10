@@ -168,4 +168,14 @@ describe('natural-language staging requires one explicit confirmation', () => {
     // The running task was never restarted or duplicated.
     expect(h.calls).toHaveLength(1)
   })
+
+  it('refreshes the same draft text when the proposal is repeated with host issue context', async () => {
+    const h = harness()
+    await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84', repositories: ['mate-manage-web'], access: 'write', issueRefs: ['mate-manage-web#84'] } })
+    await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: '处理 #84\n\n[Host 只读注入的 Issue 上下文]\n详细需求', repositories: ['mate-manage-web'], access: 'write', issueRefs: ['mate-manage-web#84'] } })
+    const tasks = h.controller.snapshot().tasks
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0]!.text).toContain('详细需求')
+    expect(tasks[0]!.proposal?.requiresScopeConfirmation).toBe(true)
+  })
 })

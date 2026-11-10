@@ -326,6 +326,8 @@ class Controller implements NightController {
       const existing = state.tasks.find(task => task.ownerId === input.actorId && task.state === 'queued'
         && task.proposal?.requiresScopeConfirmation === true && task.repositories.join(',') === repositories.join(',')
         && (request.issueRefs?.length ? task.proposal.issueRefs.some(ref => request.issueRefs!.includes(ref)) : task.text === text))
+      // Reuse the same draft, but refresh its text: a later attempt may carry host-injected issue context.
+      if (existing) { existing.text = text; existing.repositories = repositories; existing.access = access }
       const task = existing ?? this.createProposal(state, text, repositories, access, request.issueRefs, input)
       this.stage(state, input, { kind: 'task-scope', taskId: task.id }, repositories.join(','))
       reply(`将登记一个待执行任务：\n范围 ${repositories.join(',')}（${access === 'read' ? '只读' : '修改'}）。\n不含提交、推送、合并、部署，也不会自动执行。\n确认这个范围吗？回复“确认”，或“算了”。`)
