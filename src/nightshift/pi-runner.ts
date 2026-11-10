@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises'
-import { ftruncateSync, fsyncSync, writeSync } from 'node:fs'
+import { appendFileSync, chmodSync, ftruncateSync, fsyncSync, writeSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { NightConfig, Runner, RunRequest, RunResult, Task } from './contracts.ts'
@@ -192,6 +192,20 @@ export class PiRunner implements Runner {
     } finally { await bridge?.close() }
   }
 
+  /** Best-effort, owner-private, redacted startup/run diagnostics. Never returned to the model or sent to Feishu. */
+  private recordStderrDiagnostic(config: NightConfig, runId: string, tail: string): void {
+    try {
+      if (!tail.trim()) return
+      const redacted = tail
+        .replace(/\b(?:sk|ghp|gho|glpat|xox[baprs])-[A-Za-z0-9_-]{6,}\b/gi, '<redacted>')
+        .replace(/[A-Za-z0-9_\-.]{40,}/g, '<redacted>')
+        .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<redacted-email>')
+      const path = resolve(config.stateDir, 'pi-diagnostics.log')
+      appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), runId, stderr: redacted.slice(-4096) })}\n`, { mode: 0o600 })
+      chmodSync(path, 0o600)
+    } catch { /* diagnostics are best-effort and must never change the run outcome */ }
+  }
+
   private async releaseLease(config: NightConfig, inode: number): Promise<void> {
     const path = leasePath(config)
     // Verify exact namespace and ownership before unlinking, never clear someone else's lease.
@@ -211,12 +225,16 @@ export class PiRunner implements Runner {
       let exited = false; let exitCode: number | null = null; let closed = false; let done = false; let stopping = false
       let failed = false; let blocked = false; let cancelled = false; let uncertain = false; let finalAssistant = false
       let stopReason = ''; let summary = ''; let forced = false; let startupError = false
+      let stderrTail = ''
       const evidence = [`run:${runId}`, `pgid:${child.pid ?? 'not-started'}`, 'extensions:explicit-guard-only', 'tools:guarded-no-shell-no-subagents-no-MCP']
       const timers: ReturnType<typeof setTimeout>[] = []
       const later = (fn: () => void, delay: number) => { const timer = setTimeout(fn, Math.max(1, delay)); timers.push(timer); return timer }
       const finish = (gone: boolean) => {
         if (done) return
         done = true; timers.forEach(clearTimeout); signal.removeEventListener('abort', abort)
+        // A failed or blocked run needs a redacted reason; Pi's own stderr is never printed or returned to the model.
+        try { const rest = child.stderr.read(); if (typeof rest === 'string') stderrTail = (stderrTail + rest).slice(-8192) } catch { /* stream already gone */ }
+        if ((failed || startupError || blocked) && stderrTail) this.recordStderrDiagnostic(config, runId, stderrTail)
         child.stdout.removeAllListeners('data'); child.stdout.resume(); child.stderr.resume()
         if (!gone) { resolveRun(result('unknown', 'Pi process-group exit could not be verified; retain writer ownership and require recovery', false, evidence)); return }
         evidence.push('process-group:verified-gone')
@@ -328,7 +346,9 @@ export class PiRunner implements Runner {
         catch { stop('failed', 'Malformed or oversized RPC output') }
       })
       child.stdout.once('end', () => { try { frames.finish() } catch { stop('failed', 'Truncated RPC output') } })
-      child.stderr.resume() // Never print/capture provider diagnostics or credentials.
+      // Bounded redacted capture: a failed startup otherwise has no diagnosable cause. Never printed or returned.
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (chunk: string) => { stderrTail = (stderrTail + chunk).slice(-8192) })
       child.stdin.on('error', () => { if (!stopping) stop('failed', 'Pi stdin failed') })
       child.once('error', () => { startupError = true; exited = true; closed = true; failed = true; stopReason = 'Pi process failed to start'; stop('failed', stopReason); verify() })
       child.once('exit', code => { exited = true; exitCode = code; if (!stopping) stop('failed', 'Pi exited before verified completion'); verify() })

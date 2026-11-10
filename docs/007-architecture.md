@@ -448,6 +448,7 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/nightshift-dialogue.spec.ts` | Deterministic natural-language intents, local deadlines and adversarial prose rejection |
 | `tests/nightshift-dialogue-flow.spec.ts` | Staged action → one confirmation → only that action; expiry, other-owner and preflight failures |
 | `tests/nightshift-dialogue-adapter.spec.ts` | Real adapter/Outbox natural-language restate-confirm-act without direct grants |
+| `tests/nightshift-pi-diagnostics.spec.ts` | Redacted owner-private Pi startup cause for failed runs |
 | `tests/nightshift-im-replay.spec.ts` | Real Outbox failure/reopen and Feishu backfill replay without duplicate proposals or authority |
 | `tests/nightshift-im-boundary.spec.ts` | Real durable Outbox constraints, task proposal confirmation and private receipt retrieval |
 | `tests/nightshift-source-check.spec.ts` | Fixed non-executing local source gate, exact changed/staged files, and explicit no-tests/no-compile evidence |
