@@ -8,6 +8,7 @@ import { createController } from './controller.ts'
 import { parseNightCommand } from './commands.ts'
 import { parseNightProposal } from './proposals.ts'
 import { parseDialogue, type DialogueIntent } from './dialogue.ts'
+import { readIssueContext } from './issue-context.ts'
 import { boundedNightReply, replyPage } from './replies.ts'
 import type { ManagedRunner } from './release/managed-runner.ts'
 
@@ -97,6 +98,20 @@ export class NightAdapter {
           access: task.access, text: task.text, scopePending: task.proposal?.requiresScopeConfirmation === true })),
       })
       if (intent) command = dialogueCommand(intent, snapshot.tasks)
+      // Attach the exact issue's requirement text from the host, so the worker does not need network access.
+      if (intent?.kind === 'task' && intent.issueRefs?.length && command?.type === 'propose-action' && command.action.kind === 'task-proposal') {
+        const blocks: string[] = []
+        for (const ref of intent.issueRefs.slice(0, 2)) {
+          const [alias, number] = ref.split('#')
+          const repository = alias ? this.host.config.releasePolicy?.repositories[alias] : undefined
+          const issue = Number(number)
+          if (!repository || !Number.isSafeInteger(issue) || issue <= 0) continue
+          const context = await readIssueContext(repository, issue, AbortSignal.timeout(8_000))
+          if (context) blocks.push(context)
+        }
+        if (blocks.length) command = { ...command, action: { ...command.action,
+          text: `${command.action.text ?? trigger.text}\n\n[Host 只读注入的 Issue 上下文]\n${blocks.join('\n\n')}`.slice(0, 12_000) } }
+      }
       const proposal = command ? undefined : parseNightProposal(trigger.text, Object.keys(this.host.config.repositories))
       if (proposal) command = { type: 'propose' as const, ...proposal }
       if (!command) {

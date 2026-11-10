@@ -332,16 +332,22 @@ class Controller implements NightController {
       return
     }
     if (request.kind === 'start') {
-      if (this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING') { reply('现在有任务或准入检查在进行，完成或停止后再开始新的。'); return }
-      if (state.mode === 'RECOVERY_REQUIRED' || !state.writerStopped) { reply('当前是恢复态，需要先人工核查。说“可以恢复”，我再确认。'); return }
-      if (state.mode === 'NIGHT_RUNNING') { reply('夜班已在运行；要改截止时间请先说“先停一下”。'); return }
+      if (state.mode === 'RECOVERY_REQUIRED' || (state.mode !== 'NIGHT_RUNNING' && !state.writerStopped)) { reply('当前是恢复态，需要先人工核查。说“可以恢复”，我再确认。'); return }
+      if (state.mode !== 'NIGHT_RUNNING' && (this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING')) { reply('现在有任务或准入检查在进行，完成或停止后再开始新的。'); return }
+      const eligible = state.tasks.filter(task => task.ownerId === input.actorId && task.state === 'queued' && task.proposal?.requiresScopeConfirmation !== true)
+      if (!eligible.length) { reply('没有可执行的任务；先告诉我处理哪个仓库和问题。'); return }
+      const names = eligible.map(task => `${task.repositories.join(',')}（${task.access === 'read' ? '只读' : '修改'}）`).join('；')
+      // A running shift already holds the authorization window: approve now, do not demand a new start.
+      if (state.mode === 'NIGHT_RUNNING') {
+        if (!this.grantValid()) { reply('夜班运行授权已失效；请重新开始并给截止时间。'); return }
+        this.stage(state, input, { kind: 'start', deadline: state.deadline, taskId: eligible[0]!.id }, names)
+        reply(`夜班已在运行（截止 ${state.deadline}）。将批准并在该时间内启动 ${eligible.length} 个任务：${names}。\n只执行已确认范围；提交、推送、合并、部署仍各自授权。\n确认吗？回复“确认”，或“算了”。`)
+        return
+      }
       const deadlineMs = typeof request.deadline === 'string' ? instant(request.deadline) : NaN
       if (!Number.isFinite(deadlineMs) || deadlineMs <= now || deadlineMs - now > MAX_SHIFT_MS || this.frozen(now)) {
         reply('截止时间须在未来12小时内、带明确时区，且不跨越冻结窗口。'); return
       }
-      const eligible = state.tasks.filter(task => task.ownerId === input.actorId && task.state === 'queued' && task.proposal?.requiresScopeConfirmation !== true)
-      if (!eligible.length) { reply('没有可执行的任务；先告诉我处理哪个仓库和问题。'); return }
-      const names = eligible.map(task => `${task.repositories.join(',')}（${task.access === 'read' ? '只读' : '修改'}）`).join('；')
       this.stage(state, input, { kind: 'start', deadline: request.deadline, taskId: eligible[0]!.id }, names)
       reply(`将批准并启动 ${eligible.length} 个任务：${names}。\n截止 ${request.deadline}。\n只执行已确认范围；提交、推送、合并、部署仍各自授权。\n确认开始吗？回复“确认”，或“算了”。`)
       return
@@ -376,12 +382,21 @@ class Controller implements NightController {
     if (request.kind === 'start') {
       const deadlineMs = typeof request.deadline === 'string' ? instant(request.deadline) : NaN
       const now = Date.now()
-      if (!Number.isFinite(deadlineMs) || deadlineMs <= now || deadlineMs - now > MAX_SHIFT_MS || this.frozen(now)
-        || this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING') {
-        reply('当前不能开始：有任务或准入检查在进行，或截止时间已不适用。'); return
-      }
       const eligible = state.tasks.filter(task => task.ownerId === input.actorId && task.state === 'queued' && task.proposal?.requiresScopeConfirmation !== true)
       if (!eligible.length) { reply('没有可执行的任务，未开始。'); return }
+      // Already running: approving is the whole action; the existing scheduler will pick the task up.
+      if (state.mode === 'NIGHT_RUNNING') {
+        if (!this.grantValid()) { reply('夜班运行授权已失效；请重新开始并给截止时间。'); return }
+        for (const task of eligible) { task.approved = true; task.approveMessageId = input.id }
+        reply(`已批准 ${eligible.length} 个任务；将在当前截止 ${state.deadline} 内执行。`)
+        return
+      }
+      if (this.active || state.pendingCheck || this.dispatchCheck || state.mode === 'HANDOFF_PENDING') {
+        reply('当前不能开始：有任务或准入检查在进行。'); return
+      }
+      if (!Number.isFinite(deadlineMs) || deadlineMs <= now || deadlineMs - now > MAX_SHIFT_MS || this.frozen(now)) {
+        reply('当前不能开始：截止时间已不适用。'); return
+      }
       const check: PendingCheck = { id: input.id, target: input.target, kind: 'start',
         deadline: new Date(deadlineMs).toISOString(), taskIds: eligible.map(task => task.id) }
       try { this.store.acquireWorkspace() } catch (error) { reply(`拒绝：工作区锁不可用。${errorText(error)}`); return }

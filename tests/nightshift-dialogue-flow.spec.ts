@@ -37,6 +37,8 @@ async function command(controller: NightController, value: Command, incoming = i
 const texts = (controller: NightController) => controller.pendingReplies().map(reply => reply.text).join('\n')
 const deadline = (hours = 1) => new Date(Date.now() + hours * 3600_000).toISOString()
 afterEach(async () => {
+  // A queued second task may start after the first one settles; drain until no run is pending.
+  for (let i = 0; i < 8; i++) { for (const run of runs.splice(0)) run.resolve(stopped('cancelled')); await drain() }
   for (const run of runs.splice(0)) run.resolve(stopped('cancelled'))
   await drain()
   for (const controller of controllers.splice(0)) await controller.close()
@@ -142,5 +144,28 @@ describe('natural-language staging requires one explicit confirmation', () => {
     await command(h.controller, { type: 'propose-action', action: { kind: 'recover' } })
     expect(texts(h.controller)).toContain('不是恢复态')
     expect(h.controller.snapshot().mode).toBe('DAY_MANUAL')
+  })
+
+  it('approves a newly confirmed task while the shift is already running, without demanding a new start', async () => {
+    const h = harness()
+    await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: 'first', repositories: ['mate-manage-web'], access: 'write' } })
+    await command(h.controller, { type: 'confirm-action' })
+    await command(h.controller, { type: 'propose-action', action: { kind: 'start', deadline: deadline() } })
+    await command(h.controller, { type: 'confirm-action' })
+    await drain()
+    expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
+    // A second task, confirmed scope, while the first is still running.
+    await command(h.controller, { type: 'propose-action', action: { kind: 'task-proposal', text: 'second', repositories: ['mate-account'], access: 'write' } })
+    await command(h.controller, { type: 'confirm-action' })
+    const second = h.controller.snapshot().tasks[1]!
+    expect(second.approved).toBe(false)
+    await command(h.controller, { type: 'propose-action', action: { kind: 'start' } })
+    expect(texts(h.controller)).toContain('夜班已在运行')
+    await command(h.controller, { type: 'confirm-action' })
+    await drain()
+    expect(h.controller.snapshot().tasks[1]!.approved).toBe(true)
+    expect(h.controller.snapshot().mode).toBe('NIGHT_RUNNING')
+    // The running task was never restarted or duplicated.
+    expect(h.calls).toHaveLength(1)
   })
 })
