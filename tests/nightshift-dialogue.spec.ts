@@ -151,4 +151,10 @@ describe('adversarial or explicit grammar stays outside dialogue fallback', () =
     expect(parseDialogue(null as never, context())).toBeUndefined()
     expect(parseDialogue('确认', undefined as never)).toBeUndefined()
   })
+
+  describe('status phrasing variants', () => {
+    for (const text of ['进度怎么样', '进度如何', '当前进度怎么样', '现在进行到哪了', '任务情况怎么样', '进展呢']) {
+      it(`accepts ${text}`, () => { expect(parse(text)).toEqual({ kind: 'status' }) })
+    }
+  })
 })

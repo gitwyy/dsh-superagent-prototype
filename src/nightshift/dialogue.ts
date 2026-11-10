@@ -144,7 +144,8 @@ export function parseDialogue(text: string, context: DialogueContext): DialogueI
     if (/^(?:算了|不用了|取消这个|先不要|不对)$/u.test(compact)) return { kind: 'decline' }
     if (/^(?:停一下|先停|先停一下|暂停|先暂停|暂停一下|停下|先别做了)$/u.test(compact)) return { kind: 'pause' }
     if (/^(?:收工|我要接手|我来接手|我要接班|接班|交接|结束夜班|白天人工)$/u.test(compact)) return { kind: 'handoff' }
-    if (/^(?:状态|进度|到哪了|现在怎么样|现在怎么样了|怎么样了|进展怎么样|进展如何|情况怎么样|任务怎么样|在做什么|做完没|好了没|现在进度|现在做到哪了)$/u.test(compact)) return { kind: 'status' }
+    // Status phrasing is open-ended in Chinese; accept common shapes rather than an exact list.
+    if (/^(?:(?:当前|现在|目前)?(?:状态|进度|进展|情况|进行|执行)(?:怎么样|如何|到哪了|呢)?|(?:现在|目前|当前)?怎么样(?:了|呢)?|任务(?:情况|进度|状态)?(?:怎么样|如何|到哪了)?(?:了|呢)?|到哪了|做完没|做好没|好了没|在做什么|现在做到哪了|跑到哪了)$/u.test(compact)) return { kind: 'status' }
     if (/^(?:可以恢复|已核查|已经核查|已核查可以恢复|已经核查可以恢复)$/u.test(compact)) return { kind: 'recover' }
     if (/^(?:允许提交|可以提交|提交吧|保存代码|可以验证|跑测试)$/u.test(compact)) {
       const queued = context.tasks.filter(task => task.state === 'queued')
