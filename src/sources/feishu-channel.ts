@@ -28,6 +28,17 @@ export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message:
   }
   return 'sent'
 }
+/**
+ * Best-effort receipt marker: one 👀 reaction on the person's message, so a sender can tell the message arrived
+ * even before any reply is queued. Failure is silent and never affects intake.
+ */
+export async function reactSeen(host: Pick<SourceContext, 'commands'>, messageId: string | undefined): Promise<void> {
+  if (!messageId || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) return
+  try {
+    await host.commands.lark(['api', 'POST', `/open-apis/im/v1/messages/${messageId}/reactions`,
+      '--data', JSON.stringify({ reaction_type: { emoji_type: 'EYES' } })])
+  } catch { /* a reaction is a convenience, not a delivery guarantee */ }
+}
 /** Fallback chat link on the bot's brand; the message's own deep link on its Trigger is preferred when available. */
 export const feishuLink = (address: Record<string, string>, links: ChannelLinks): ChannelLink => ({
   url: feishuChatLink(links.feishu?.brand ?? 'feishu', address.chatId ?? ''), label: { zh: '飞书消息', en: 'Feishu message' },

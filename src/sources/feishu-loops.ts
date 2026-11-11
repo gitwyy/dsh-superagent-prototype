@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { threadKey, type Thread, type Trigger } from '../core/index.ts'
-import { feishuChatLink } from './feishu-channel.ts'
+import { feishuChatLink, reactSeen } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { validItems, type Tally } from '../infra/commands.ts'
 import { readFeishu, type FeishuRef } from './feishu-read.ts'
@@ -25,6 +25,8 @@ const bot = (ctx: SourceContext): FeishuBot => {
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
   await ctx.receive(trigger)
+  // Mark the person's own message as received; intake never depends on it.
+  if (trigger.human) void reactSeen(ctx, typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined)
   const chatId = String(trigger.meta.chatId ?? '')
   if (!chatId) return
   const name = ctx.state.get(KV.sources.labels(SOURCE))?.[chatId] ?? chatId
