@@ -242,6 +242,14 @@ export class Tickets extends EnginePart {
     const running = runningAssignment(ticket), latest = latestAssignment(ticket)
     if (running) this.options.executor.deliver(ticket, running)
     else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.options.executor.start(ticket, latest)
+    else if (input.kind === 'trigger' && input.human && !waitsForPerson(ticket)) {
+      // A live but idle ticket (every earlier Assignment settled) must open a fresh Assignment for a
+      // person's message; otherwise it waits forever in an idle ticket and is never answered. Bot and
+      // CI facts never start a round, so a closed PR still ends its ticket.
+      const assignment = this.newAssignment(ticket)
+      this.repo.tickets.save(ticket)
+      this.options.executor.start(ticket, assignment)
+    }
   }
   /**
    * Resume an ended ticket under its unchanged Mandate when a person's message on one of its Threads waits for it: no Eval
