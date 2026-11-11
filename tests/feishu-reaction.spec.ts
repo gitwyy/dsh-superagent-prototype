@@ -3,13 +3,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { reactSeen } from '../src/sources/feishu-channel.ts'
 
 describe('feishu received reaction', () => {
-  it('reacts once to the exact message with EYES', async () => {
+  it('reacts once to the exact message with OK', async () => {
     const lark = vi.fn(async () => '{"ok":true}')
     await reactSeen({ commands: { lark } } as never, 'om_x100b600b44bdb0a8c45b0da483dc36a')
     expect(lark).toHaveBeenCalledTimes(1)
     expect(lark).toHaveBeenCalledWith(['api', 'POST',
       '/open-apis/im/v1/messages/om_x100b600b44bdb0a8c45b0da483dc36a/reactions',
-      '--data', JSON.stringify({ reaction_type: { emoji_type: 'EYES' } })])
+      '--data', JSON.stringify({ reaction_type: { emoji_type: 'OK' } })])
   })
   it('does nothing without a message id or with a malformed one', async () => {
     const lark = vi.fn(async () => '')
