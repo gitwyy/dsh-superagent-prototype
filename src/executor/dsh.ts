@@ -373,11 +373,28 @@ export class DshExecutor implements Executor {
     this.track(ticketId, stopBackground(this.host.context, workerSessionId(ticketId), reason, keepInbox))
   }
   /** A stop of a ticket's background work, which a launch or a delivery of the ticket waits for while it runs. */
-  private track(ticketId: string, stop: Promise<void>): void {
-    const entry: Promise<void> = Promise.all([this.stopping.get(ticketId), stop.catch(() => {})]).then(() => {})
+  private track(ticketId: string, stop: Promise<unknown>): void {
+    const entry: Promise<void> = Promise.all([this.stopping.get(ticketId), stop.then(() => {}, () => {})]).then(() => {})
       .finally(() => { if (this.stopping.get(ticketId) === entry) this.stopping.delete(ticketId) })
     this.stopping.set(ticketId, entry)
-    void this.background(stop)
+    void this.reportStop(ticketId, stop)
+  }
+  /**
+   * Report what a worker's background cleanup could not stop. The assignment is already ended and the ticket is settled, so a
+   * cleanup failure is a warning, not a broken worker: marking the whole worker `error` hid working tickets behind a red bar.
+   */
+  private async reportStop(ticketId: string, stop: Promise<unknown>): Promise<void> {
+    const { health } = this.host
+    let problems: string[]
+    try { const result = await stop; problems = Array.isArray(result) ? result.map(String) : [] }
+    catch (error) { problems = [String(error)] }
+    const current = health.get()
+    if (problems.length) {
+      if (current?.state !== 'error') health.set({ state: 'ready', at: now(),
+        detail: `${workerSessionId(ticketId)} background cleanup left ${problems.length} item(s): ${problems[0]!.slice(0, 200)}` })
+      return
+    }
+    if (current?.state === 'error') health.set({ state: 'ready', detail: 'Worker events are handled', at: now() })
   }
   /** Wait for a stop of the ticket's background work that runs, unless the host stops first. */
   private async stopped(ticketId: string): Promise<void> {

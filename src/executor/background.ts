@@ -103,6 +103,13 @@ export async function untilQuiet(ctx: Context, agent: Agent, signal: AbortSignal
   }
 }
 
+/** A kill that fails only because the job already ended needs no cleanup; other failures are real. */
+/** Readable detail for a cleanup failure, flattening an AggregateError so the panel shows the real cause. */
+const detailOf = (error: unknown): string => error instanceof AggregateError
+  ? `${error.message} [${error.errors.map(item => String(item)).join('; ').slice(0, 400)}]`
+  : String(error)
+const alreadyEnded = (error: unknown): boolean => /not found|no such|unknown|already|has ended|finished|not running/i.test(String(error))
+
 /**
  * Kill the shell jobs the Session owns, but those in `except`, collecting each end so the worker is not woken to hear of it.
  * One failure stops none other.
@@ -113,7 +120,7 @@ export async function killJobs(ctx: Context, sessionId: string, reason: string, 
   const failures: unknown[] = []
   // The waits start before the kills, so each end counts as collected.
   const collected = live.map(job => jobs!.wait(job.id, KILL_WAIT_MS, sessionId).catch(() => undefined))
-  for (const job of live) try { jobs!.kill(job.id, sessionId, reason) } catch (error) { failures.push(error) }
+  for (const job of live) try { jobs!.kill(job.id, sessionId, reason) } catch (error) { if (!alreadyEnded(error)) failures.push(error) }
   await Promise.all(collected)
   if (failures.length) throw new AggregateError(failures, `Killing the shell jobs of ${sessionId} failed`)
 }
@@ -156,10 +163,10 @@ export async function stopSubagents(ctx: Context, agent: Agent, keepInbox = fals
  * Stop what a worker runs in the background once its Assignment ends: kill its shell jobs and release its subagents (see
  * `stopSubagents`). A Session not loaded has no subagent at work. One failure stops nothing else.
  */
-export async function stopBackground(ctx: Context, sessionId: string, reason: string, keepInbox = false): Promise<void> {
-  const failures: unknown[] = []
-  await killJobs(ctx, sessionId, reason).catch((error: unknown) => { failures.push(error) })
+export async function stopBackground(ctx: Context, sessionId: string, reason: string, keepInbox = false): Promise<string[]> {
+  const failures: string[] = []
+  await killJobs(ctx, sessionId, reason).catch((error: unknown) => { failures.push(detailOf(error)) })
   const agent = ctx.agents.get(sessionId as SessionId)
-  if (agent) await stopSubagents(ctx, agent, keepInbox).catch((error: unknown) => { failures.push(error) })
-  if (failures.length) throw new AggregateError(failures, `Stopping the background work of ${sessionId} failed`)
+  if (agent) await stopSubagents(ctx, agent, keepInbox).catch((error: unknown) => { failures.push(detailOf(error)) })
+  return failures
 }

@@ -452,6 +452,7 @@ The generic modules name the deployment's VCS through `Deployment.vcs` and the S
 | `tests/nightshift-pi-diagnostics.spec.ts` | Redacted owner-private Pi startup cause for failed runs |
 | `tests/nightshift-issue-context.spec.ts` | Bounded host issue context, missing/expired credential and size limits |
 | `tests/feishu-reaction.spec.ts` | Best-effort received reaction on a person's Feishu message |
+| `tests/executor-background.spec.ts` | Worker background cleanup tolerates ended jobs and reports, not throws, real failures |
 | `tests/nightshift-im-replay.spec.ts` | Real Outbox failure/reopen and Feishu backfill replay without duplicate proposals or authority |
 | `tests/nightshift-im-boundary.spec.ts` | Real durable Outbox constraints, task proposal confirmation and private receipt retrieval |
 | `tests/nightshift-source-check.spec.ts` | Fixed non-executing local source gate, exact changed/staged files, and explicit no-tests/no-compile evidence |
