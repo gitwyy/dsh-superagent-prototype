@@ -3,7 +3,7 @@ import { liveTicket, type Thread } from '../core/index.ts'
 import { health, type Health, type SourceContext } from './host.ts'
 
 /** How long a subscribed Thread with no live Ticket continues to be polled after its last Trigger or Ticket end. */
-export const POLL_HORIZON_MS = 14 * 24 * 3600_000
+export const POLL_HORIZON_MS = 7 * 24 * 3600_000
 /** True when a subscribed thread has a live ticket or recent activity/completion within `POLL_HORIZON_MS`. */
 export function polled(ctx: SourceContext, thread: Thread, now = Date.now()): boolean {
   const tickets = thread.subscriptions.map(id => ctx.tickets.get(id))

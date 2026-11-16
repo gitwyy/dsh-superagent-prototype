@@ -27,14 +27,15 @@ function fixture(script: string) {
     sessionFile: join(stateDir, 'session.jsonl'), repositories: { repo: workspace }, maxTaskSeconds: 30, freezeWindows: [] }
   const task: Task = { id: 'diag-task', originId: 'diag-origin', ownerId: 'owner', text: 'inspect only', repositories: ['repo'], access: 'read', approved: true,
     target: { source: 'feishu', chatId: 'dm', messageId: 'm' }, state: 'running', createdAt: new Date().toISOString() }
-  const runner = createPiRunner({ guardPath: '/Code/github/dsh-superagent-prototype/resources/nightshift-guard.mjs', startupTimeoutMs: 4000 })
+  // Use the runner's default guard (this checkout's resources/), so the test does not depend on a deploy path.
+  const runner = createPiRunner({ startupTimeoutMs: 4000 })
   const run = () => runner.run({ runId: 'diag-run', task, deadline: new Date(Date.now() + 20_000).toISOString(), config }, new AbortController().signal)
   return { root, config, executable, run, diagnostic: () => existsSync(join(stateDir, 'pi-diagnostics.log')) ? readFileSync(join(stateDir, 'pi-diagnostics.log'), 'utf8') : '' }
 }
 
 describe('Pi startup diagnostics', () => {
   it('records a redacted startup cause for a failed run without exposing credentials', async () => {
-    const f = fixture('#!/bin/sh\necho "Failed to load extension: bad policy token=sk-abcdefghijklmnop123456" >&2\nexit 1\n')
+    const f = fixture('#!/bin/sh\necho "Failed to load extension: bad policy token=sk-abcdefghijklmnop123456" >&2\nsleep 0.2\nexit 1\n')
     const result = await f.run()
     expect(['failed', 'blocked']).toContain(result.outcome)
     const diagnostic = f.diagnostic()

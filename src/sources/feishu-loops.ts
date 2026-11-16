@@ -15,6 +15,10 @@ import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
 
+/** How often the history backfill and thread polling run as a safety net behind the live event stream. */
+const HISTORY_POLL_MS = 5 * 60_000
+/** How often chat names are refreshed; they change rarely and only affect display. */
+const CHAT_NAMES_MS = 60 * 60_000
 export const runFeishu = (ctx: SourceContext, signal: AbortSignal): Promise<unknown> =>
   Promise.allSettled([watch, backfillLoop, chatNamesLoop].map(loop => loop(ctx, signal)))
 const enabled = (ctx: SourceContext): FeishuConfig | undefined => ctx.config<FeishuConfig>(SOURCE)
@@ -124,7 +128,7 @@ async function chatNamesLoop(ctx: SourceContext, signal: AbortSignal): Promise<v
       try { await refreshChatNames(ctx, signal) }
       catch { /* Names are a display aid; the stored list stays until a later read succeeds. */ }
     }
-    await delay(60_000, undefined, { signal }).catch(() => {})
+    await delay(CHAT_NAMES_MS, undefined, { signal }).catch(() => {})
   }
 }
 async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
@@ -158,7 +162,7 @@ async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<vo
     if (!signal.aborted) ctx.report('history', errors.length
       ? { state: 'error', detail: errors.join('\n') }
       : { state: 'ready', detail: `Configured groups and known direct chats recovered${skipped}`, at: new Date().toISOString() })
-    await delay(60_000, undefined, { signal }).catch(() => {})
+    await delay(HISTORY_POLL_MS, undefined, { signal }).catch(() => {})
   }
 }
 /**

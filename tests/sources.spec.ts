@@ -181,14 +181,14 @@ describe('feishu source', () => {
     expect(feishuTime('2026-09-11 12:00')).toBe(new Date(2026, 8, 11, 12, 0).toISOString())
     expect(() => feishuTime('soon')).toThrow('Unreadable Feishu message time')
   })
-  it('polls a subscribed topic while a live ticket follows it or it had a message in the last two weeks', async () => {
+  it('polls a subscribed topic while a live ticket follows it or it had a message in the last seven days', async () => {
     const h = host()
     const source = feishuTrigger({ message_id: 'om_root', chat_id: 'oc_1', chat_type: 'group', sender_id: MEMBER, sender_type: 'user',
       content: 'fix', create_time: '1' }, 'ou_bot', 'cli_bot')!
     h.store.triggers.save(source)
     subscribed(h, source.threads[0]!)
     h.store.threads.save({ ...h.store.threads.get('feishu:oc_1:om_root')!,
-      lastAt: new Date(Date.now() - 15 * 24 * 3600_000).toISOString() })
+      lastAt: new Date(Date.now() - 8 * 24 * 3600_000).toISOString() })
     const lark = vi.spyOn(h.commands, 'lark').mockResolvedValue({ items: [] })
     await pollFeishuThreads(h)
     expect(lark).not.toHaveBeenCalled()
@@ -258,7 +258,7 @@ describe('feishu source', () => {
     expect(lark.mock.calls.filter(([args]) => args[1] === '+threads-messages-list')).toHaveLength(1)
     h.store.close()
   })
-  it('recovers the topics of a chat while they had a message in the last two weeks, and forgets quieter ones', async () => {
+  it('recovers the topics of a chat while they had a message in the last seven days, and forgets quieter ones', async () => {
     const h = host()
     const day = 24 * 3600_000
     const start = Date.parse('2026-09-01T00:00:00.000Z')
@@ -280,9 +280,9 @@ describe('feishu source', () => {
       await backfillChat(h, 'oc_team', false, since, new Date(start + round * day + 60_000).toISOString(), new AbortController().signal)
       if (round === 0) expect(scans).toContain('omt_old')
     }
-    // The chat, and the topics with a message in the last 14 days.
-    expect(scans).toHaveLength(1 + 14)
-    expect(Object.keys(h.store.get<Record<string, string>>('feishu-history-threads:oc_team')!)).toHaveLength(14)
+    // The chat, and the topics with a message in the last 7 days.
+    expect(scans).toHaveLength(1 + 7)
+    expect(Object.keys(h.store.get<Record<string, string>>('feishu-history-threads:oc_team')!)).toHaveLength(7)
     expect(h.store.get<Record<string, string>>('feishu-history-threads:oc_team')!.omt_29).toBe(new Date(start + 29 * day).toISOString())
     h.store.close()
   })
@@ -494,7 +494,7 @@ describe('github source', () => {
     expect(h.store.threads.get('github:7')!.meta).toMatchObject({ title: 'Fix the margin', label: '#7 Fix the margin', facts: { number: { value: '#7' } } })
     h.store.close()
   })
-  it('polls a subscribed Thread for two weeks after the Ticket that follows it ended', async () => {
+  it('polls a subscribed Thread for seven days after the Ticket that follows it ended', async () => {
     const h = host()
     const day = 24 * 3600_000
     h.store.threads.save({ key: 'github:7', ref: { source: 'github', id: '7' }, createdAt: '2026-09-01T00:00:00Z',
@@ -506,22 +506,22 @@ describe('github source', () => {
     ended(3 * day)
     await pollGithubThreads(h)
     expect(bare(reads)).toEqual(['issues/7/comments'])
-    ended(15 * day)
+    ended(8 * day)
     await pollGithubThreads(h)
     expect(bare(reads)).toEqual(['issues/7/comments'])
     h.store.close()
   })
-  it('polls a subscribed Thread while a live ticket follows it or its last Trigger is under two weeks old', async () => {
+  it('polls a subscribed Thread while a live ticket follows it or its last Trigger is under seven days old', async () => {
     const h = host()
     const day = 24 * 3600_000
     const thread = (lastAt: number, subscriptions = ['t']) => h.store.threads.save({ key: 'github:7', ref: { source: 'github', id: '7' },
       createdAt: '2026-09-01T00:00:00Z', lastAt: new Date(Date.now() - lastAt).toISOString(),
       subscriptions, correlated: [], pending: [], meta: { number: 7, isPr: false, title: 'Login fails' } })
     const reads = github(h, {})
-    thread(15 * day)
+    thread(8 * day)
     await pollGithubThreads(h)
     expect(reads).toEqual([])
-    thread(13 * day)
+    thread(6 * day)
     await pollGithubThreads(h)
     expect(bare(reads)).toEqual(['issues/7/comments'])
     // A live ticket keeps a quiet Thread polled.
